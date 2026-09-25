@@ -1,0 +1,6 @@
+Quantity,Part Number,Customer Reference
+3,ED2609-ND,J8 J9 J10 - Terminal block 2P 5.08mm
+26,1849-FR20204VBNN-ND,TMC2209 rows (4+4) + ESP32-S3 remainder - 1x4 female socket
+6,1849-FR20206VBNN-ND,ESP32-S3 rows - 1x6 female socket
+6,612-HSS-102-T-22-ND,TMC2209 DIAG - 1x2 female socket
+1,732-5319-ND,J4 - 1x6 male header (skip if in Dupont kit)

@@ -1,0 +1,45 @@
+Plugin v0.0.1 running on KiCad 10.0.5 and Python 3.9.13 (v3.9.13:6de2ca5339, May 17 2022, 11:37:23) 
+[Clang 13.0.0 (clang-1300.0.29.30)] on darwin.
+Valid Board found for /Users/zachsharma/Documents/PNP/PNP.kicad_sch
+8 sheet instances entries in /Users/zachsharma/Documents/PNP/PNP.kicad_sch
+Valid Board found for /Users/zachsharma/Documents/PNP/TMC2209_Daughterboard_Circuit/TMC2209_Daughterboard_Circuit.kicad_sch
+/Users/zachsharma/Documents/PNP/Vacuum.kicad_pcb doesn't exist
+1 sheet instances entries in /Users/zachsharma/Documents/PNP/Vacuum.kicad_sch
+Valid Board found for /Users/zachsharma/Documents/PNP/3.3V_Circuit/3.3V_Circuit.kicad_sch
+1 sheet instances entries in /Users/zachsharma/Documents/PNP/Vacuum.kicad_sch
+Anchor changed to R7
+Anchor changed to Q1
+Enabled leaf: 414570f8-dd06-4785-ae41-ce07d60e8131
+Enabled leaf: b7b311f1-1e53-4dba-8528-30449b705564
+Enabled leaf: 5adc832a-6806-458b-adf3-e49969f8966a
+Enabled leaf: 73e8a086-942d-4f5c-9fb2-10fe6d359332
+Enabled leaf: 7b8eac31-5454-4d77-ab1d-32b30d9a9d60
+Enabled leaf: a2bc95bf-9cca-434e-9d2b-8c25679d09dc
+Enabled leaf: b8aae072-665e-4003-b4ad-d21f6bac5546
+Enabled leaf: b7b311f1-1e53-4dba-8528-30449b705564
+Root item: <wx._dataview.TreeListItem object at 0x14731b160>
+Valid board for 414570f8-dd06-4785-ae41-ce07d60e8131
+Valid child board for 
+Instance is a branch: Root
+Valid board for 414570f8-dd06-4785-ae41-ce07d60e8131
+Instance is a leaf: /414570f8-dd06-4785-ae41-ce07d60e8131
+Valid board for b7b311f1-1e53-4dba-8528-30449b705564
+Valid child board for 585974c4-bdda-4568-a2f1-315d6389c2c9
+Instance is a branch: Vacuum Left
+Valid board for b7b311f1-1e53-4dba-8528-30449b705564
+Instance is a leaf: /585974c4-bdda-4568-a2f1-315d6389c2c9/b7b311f1-1e53-4dba-8528-30449b705564
+Valid board for 5adc832a-6806-458b-adf3-e49969f8966a
+Instance is a leaf: /5adc832a-6806-458b-adf3-e49969f8966a
+Valid board for 73e8a086-942d-4f5c-9fb2-10fe6d359332
+Instance is a leaf: /73e8a086-942d-4f5c-9fb2-10fe6d359332
+Valid board for 7b8eac31-5454-4d77-ab1d-32b30d9a9d60
+Instance is a leaf: /7b8eac31-5454-4d77-ab1d-32b30d9a9d60
+Valid board for a2bc95bf-9cca-434e-9d2b-8c25679d09dc
+Instance is a leaf: /a2bc95bf-9cca-434e-9d2b-8c25679d09dc
+Valid board for b8aae072-665e-4003-b4ad-d21f6bac5546
+Instance is a leaf: /b8aae072-665e-4003-b4ad-d21f6bac5546
+Valid board for b7b311f1-1e53-4dba-8528-30449b705564
+Valid child board for de7c5140-6677-4518-9eae-02270a144848
+Instance is a branch: Vacuum Right
+Valid board for b7b311f1-1e53-4dba-8528-30449b705564
+Instance is a leaf: /de7c5140-6677-4518-9eae-02270a144848/b7b311f1-1e53-4dba-8528-30449b705564

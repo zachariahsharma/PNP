@@ -1,0 +1,110 @@
+(footprint "Mini MP1584EN Buck Converter Module"
+	(version 20260206)
+	(generator "pcbnew")
+	(generator_version "10.0")
+	(layer "F.Cu")
+	(property "Reference" "REF**"
+		(at 0 -0.5 0)
+		(unlocked yes)
+		(layer "F.SilkS")
+		(uuid "3d3ab392-2775-4915-bb36-721cd8255d8d")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.1)
+			)
+		)
+	)
+	(property "Value" "Mini MP1584EN Buck Converter Module"
+		(at 0 -7.9 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "8c3c5aad-a6ce-4c63-af2f-2567d7113842")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "1e9bc490-7ffe-43ce-9706-ac9696171181")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "7a047900-a392-46ec-a668-610342ef3164")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd)
+	(duplicate_pad_numbers_are_jumpers no)
+	(fp_rect
+		(start -8.75 -6.15)
+		(end 8.75 6.15)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.SilkS")
+		(uuid "8989a35c-1c1c-4e24-8b5e-c3f42400438b")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 2.5 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(uuid "4ced4f20-74ba-4bab-8e5a-e86e6d3bb964")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" smd roundrect
+		(at -8.75 -4.15)
+		(size 3 2.5)
+		(layers "F.Cu" "F.Mask")
+		(roundrect_rratio 0.15)
+		(uuid "ed3e9049-7d3f-4150-825f-7fe2e5456699")
+	)
+	(pad "2" smd roundrect
+		(at 8.75 -4.15)
+		(size 3 2.5)
+		(layers "F.Cu" "F.Mask")
+		(roundrect_rratio 0.15)
+		(uuid "18d47115-9d47-47c5-9e5a-ef628b5d781b")
+	)
+	(pad "3" smd roundrect
+		(at -8.75 4.15)
+		(size 3 2.5)
+		(layers "F.Cu" "F.Mask")
+		(roundrect_rratio 0.15)
+		(uuid "c1380b18-d0a3-47d1-971a-09e9ca1a369b")
+	)
+	(pad "3" smd roundrect
+		(at 8.75 4.15)
+		(size 3 2.5)
+		(layers "F.Cu" "F.Mask")
+		(roundrect_rratio 0.15)
+		(uuid "808db873-5736-4fe3-b2e6-f2ed1721f503")
+	)
+	(embedded_fonts no)
+)
