@@ -1,0 +1,13 @@
+﻿Designator,Footprint,Quantity,Value,LCSC Part #
+"C1, C2, C3, C4, C5, C6",CP_Radial_D8.0mm_P3.50mm,6,100uF,
+"D1, D2",D_DO-41_SOD81_P10.16mm_Horizontal,2,1N4007,
+"J1, J2, J3, J5, J6, J7",JST_EH_B4B-EH-A_1x04_P2.50mm_Vertical,6,Conn_01x04_Socket,
+"J10, J8, J9","TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal",3,Screw_Terminal_01x02,
+J4,PinHeader_2x06_P2.54mm_Vertical,1,Conn_01x06_Socket,
+"Q1, Q3",TO-220-3_Vertical,2,IRLZ44N,
+"R1, R3",R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,2,1K,
+"R12, R5",R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,2,100,
+"R13, R2, R9",R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,3,10K,
+U1,ESP32-S3-DevKitC,1,ESP32-S3-DevKitC,
+U2,Mini MP1584EN Buck Converter Module,1,~,
+"U3, U4, U5, U7, U8, U9",TMC2209 V1.3,6,~,

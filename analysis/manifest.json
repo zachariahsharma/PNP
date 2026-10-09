@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "PNP.kicad_pro",
-  "current": "2026-09-07_1347",
+  "current": "2026-09-28_1246-2",
   "runs": {
     "2026-09-06_2340": {
       "source_hashes": {
@@ -29,6 +29,35 @@
         "schematic": "analyze_schematic.py PNP.kicad_sch"
       },
       "generated": "2026-09-07T14:38:58-05:00",
+      "pinned": false
+    },
+    "2026-09-28_1246": {
+      "source_hashes": {
+        "PNP.kicad_sch": "sha256:2e2346ce7d051e1dbe769b44e113d3ab12b2fda7a6fcac1415045cd7c8fa96e7"
+      },
+      "outputs": {
+        "schematic": "schematic.json",
+        "pcb": "pcb.json"
+      },
+      "scripts": {
+        "schematic": "analyze_schematic.py PNP.kicad_sch"
+      },
+      "generated": "2026-09-28T12:46:22-05:00",
+      "pinned": false
+    },
+    "2026-09-28_1246-2": {
+      "source_hashes": {
+        "PNP.kicad_pcb": "sha256:e845f2fddd18162492d995cd3f6c47a5427d0206004518e28e04f50f8f5902ac"
+      },
+      "outputs": {
+        "schematic": "schematic.json",
+        "pcb": "pcb.json",
+        "cross_analysis": "cross_analysis.json"
+      },
+      "scripts": {
+        "pcb": "analyze_pcb.py PNP.kicad_pcb"
+      },
+      "generated": "2026-09-28T12:47:57-05:00",
       "pinned": false
     }
   }

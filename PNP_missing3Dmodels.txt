@@ -1,0 +1,9 @@
+### Missing 3D models - created on 2026-09-27 16:03
+### Printed by checking_3D_models plugin
+Board file: /Users/zach/Documents/laptop/PNP/PNP.kicad_pcb
+3D missing models written to:
+/Users/zach/Documents/laptop/PNP/PNP_missing3Dmodels.txt
+-------
+-------
+NUM of 3D missing models:0
+checked extensions ['.stp', '.step', '.stpZ']
