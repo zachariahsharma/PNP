@@ -1,0 +1,27 @@
+# KiCad local history, backups, autosaves, locks, per-user view settings
+*-backups/
+*.bak
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*.kicad_prl
+_autosave-*
+~*.lck
+\#auto_saved_files#
+fp-info-cache
+*.log
+
+# PlatformIO / firmware build output
+.pio/
+build/
+
+# OS / editor junk
+.DS_Store
+.vscode/ipch/
+.vscode/.browse.c_cpp.db*
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+credentials.json
