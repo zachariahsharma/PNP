@@ -564,7 +564,7 @@
       "netlist": "",
       "plot": "Gerber/",
       "specctra_dsn": "",
-      "step": "",
+      "step": "../../../Downloads/PNP.step",
       "vrml": ""
     },
     "page_layout_descr_file": ""
