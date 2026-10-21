@@ -1,0 +1,236 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PNP Driver Tuner</title>
+<style>
+ :root{color-scheme:dark}
+ body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#0f1115;color:#e6e6e6}
+ header{padding:14px 18px;background:#171a21;border-bottom:1px solid #2a2e37;display:flex;justify-content:space-between;align-items:center}
+ header b{font-size:19px}
+ button{background:#22262f;color:#e6e6e6;border:1px solid #2a2e37;border-radius:8px;padding:8px 12px;font-size:14px;cursor:pointer}
+ .wrap{display:flex;flex-wrap:wrap;gap:14px;padding:14px}
+ .card{background:#171a21;border:1px solid #2a2e37;border-radius:12px;padding:14px;flex:1;min-width:290px}
+ .card h2{margin:0 0 10px;font-size:17px}
+ .row{margin:11px 0}
+ label{display:block;font-size:13px;color:#9aa0aa;margin-bottom:5px}
+ .val{float:right;color:#e6e6e6;font-variant-numeric:tabular-nums}
+ input[type=range]{width:100%;accent-color:#2d6cdf}
+ input[type=number]{background:#22262f;color:#e6e6e6;border:1px solid #2a2e37;border-radius:6px;padding:6px;width:80px}
+ select{background:#22262f;color:#e6e6e6;border:1px solid #2a2e37;border-radius:8px;padding:8px;width:100%}
+ .toggle{display:flex;gap:8px}.toggle button{flex:1}
+ .on{background:#2d6cdf;border-color:#2d6cdf;color:#fff}
+ .enbtn.on{background:#1f8a4c;border-color:#1f8a4c;color:#fff}
+ .btns{display:flex;gap:8px;margin-top:8px}
+ .run{background:#1f8a4c;border-color:#1f8a4c;color:#fff}
+ .stop{background:#b23b3b;border-color:#b23b3b;color:#fff}
+ .status{padding:2px 18px 16px;color:#9aa0aa;font-size:13px}
+ .estop{width:100%;background:#b23b3b;border-color:#b23b3b;color:#fff;font-size:18px;font-weight:700;padding:14px;letter-spacing:.5px;cursor:pointer}
+ h3{font-size:12px;color:#9aa0aa;text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;border-top:1px solid #2a2e37;padding-top:10px}
+ #settings{padding:14px;display:none}
+ .sgrid{display:grid;grid-template-columns:auto 90px 90px;gap:8px 12px;align-items:center;max-width:380px}
+ .sgrid .h{color:#9aa0aa;font-size:12px}
+ .axlist{display:flex;flex-wrap:wrap;gap:12px;margin:10px 0}
+ .axlist label{display:flex;align-items:center;gap:6px;color:#e6e6e6}
+</style><script>
+const MOCK={set:{curMin:0,curMax:1485,spdMin:0,spdMax:4000,accMin:100,accMax:50000,turnMin:0,turnMax:100,spr:200},
+ ax:[{n:'C1',active:1,cur:340,max:424,spd:0,acc:2000,mic:16,spread:1,dir:1,en:0,conn:0,fs:1,pos:0},
+     {n:'Z',active:1,cur:1200,max:1485,spd:800,acc:2000,mic:16,spread:1,dir:1,en:1,conn:0,fs:1,pos:3200}],
+ vac:{l:0,r:1}, ylink:0};
+window.fetch=(u)=>Promise.resolve({json:()=>Promise.resolve(MOCK),text:()=>Promise.resolve('ok '+u)});
+</script>
+</head><body>
+<header><b>PNP Driver Tuner</b><div><button onclick="toggleGp()">🎮 Gamepad</button> <button onclick="toggleSettings()">⚙ Settings</button></div></header>
+<div id="settings"></div>
+<div id="gppanel" style="display:none;padding:14px"></div>
+<div style="padding:8px 18px;color:#9aa0aa;font-size:13px;line-height:1.5">
+ Set values, switch a <b>Driver ON</b>, then <b>Spin ∞</b> (continuous) or <b>Run turns</b> (move a set number of turns). <b>Stop</b> halts instantly.<br>
+ <b>⚙ Settings</b>: activate axes & set slider limits · <b>🎮 Gamepad</b>: drive it with an Xbox controller.
+</div>
+<div style="padding:4px 18px 10px"><button id="estop" class="estop">■ STOP ALL</button></div>
+<div class="wrap" id="vacwrap"></div>
+<div class="wrap" id="wrap"></div>
+<div class="status" id="status">loading…</div>
+<script>
+const MS=[1,2,4,8,16,32,64,128,256];
+const MOTOR={C0:'Nema 8 · 0.6A',C1:'Nema 8 · 0.6A',X:'Nema 17 · 2.1A',Y0:'Nema 17 · 2.1A',Y1:'Nema 17 · 2.1A',Z:'Nema 17 · 2.1A'};
+const status=document.getElementById('status');
+let S={}, AX=[], VAC={l:0,r:0}, YLINK=0;
+function api(u){return fetch(u).then(r=>r.text()).then(t=>{status.textContent=t;});}
+function act(on,off){on.classList.add('on');off.classList.remove('on');}
+
+function renderVac(){
+ document.getElementById('vacwrap').innerHTML=`
+  <div class="card"><h2>Vacuum</h2>
+   <div class="row"><label>Vacuum Left (GPIO7)</label>
+    <div class="toggle"><button id="vl0">OFF</button><button id="vl1">ON</button></div></div>
+   <div class="row"><label>Vacuum Right (GPIO4)</label>
+    <div class="toggle"><button id="vr0">OFF</button><button id="vr1">ON</button></div></div>
+  </div>`;
+ const vl0=gid('vl0'),vl1=gid('vl1'),vr0=gid('vr0'),vr1=gid('vr1');
+ act(VAC.l?vl1:vl0, VAC.l?vl0:vl1); act(VAC.r?vr1:vr0, VAC.r?vr0:vr1);
+ vl0.onclick=()=>{api('/vac?side=left&on=0');act(vl0,vl1);};
+ vl1.onclick=()=>{api('/vac?side=left&on=1');act(vl1,vl0);};
+ vr0.onclick=()=>{api('/vac?side=right&on=0');act(vr0,vr1);};
+ vr1.onclick=()=>{api('/vac?side=right&on=1');act(vr1,vr0);};
+}
+
+function render(){
+ renderVac();
+ // ---- settings panel ----
+ const rng=(k,lbl)=>`<div class="h">${lbl}</div>
+   <input type="number" id="${k}Min" value="${S[k+'Min']}"><input type="number" id="${k}Max" value="${S[k+'Max']}">`;
+ document.getElementById('settings').innerHTML=`
+  <h2 style="margin:4px 0">Slider ranges</h2>
+  <div class="sgrid">
+   <div class="h"></div><div class="h">min</div><div class="h">max</div>
+   ${rng('cur','Current (mA)')}${rng('spd','Speed (Hz)')}${rng('acc','Accel (st/s²)')}${rng('turn','Turns')}
+   <div class="h">Steps/rev</div><input type="number" id="spr" value="${S.spr}"><div></div>
+  </div>
+  <h2 style="margin:14px 0 4px">Active axes</h2>
+  <div class="axlist">${AX.map(a=>`<label><input type="checkbox" ${a.active?'checked':''} id="ax${a.n}">${a.n}${a.fs?'':' (no step ch!)'}</label>`).join('')}</div>
+  <h2 style="margin:14px 0 4px">Y pairing</h2>
+  <label class="axlist"><input type="checkbox" id="ylink" ${YLINK?'checked':''}> Link Y0 ↔ Y1 (spin / move together)</label>
+  <button class="run" onclick="saveSettings()">Save settings</button>`;
+ gid('ylink').onchange=e=>api('/pair?on='+(e.target.checked?1:0));
+ // ---- axis cards ----
+ document.getElementById('wrap').innerHTML=AX.filter(a=>a.active).map(card).join('')||'<div class="status">No active axes — enable some in ⚙ Settings.</div>';
+ AX.filter(a=>a.active).forEach(wire);
+ status.textContent='UART conn '+AX.map(a=>a.n+'='+a.conn).join(', ')+'  (0=OK)';
+}
+function card(a){const i=a.n;return `
+ <div class="card"><h2>${a.n} <span style="font-size:12px;color:#9aa0aa;font-weight:400">${MOTOR[a.n]||''}</span> <span class="val" style="font-size:12px;color:${a.conn==0?'#3fb765':'#e06b6b'}">${a.conn==0?'● online':'● no UART'}</span></h2>
+  <div class="row"><label>Run current <span class="val" id="cv${i}"></span> mA (max ${a.max})</label>
+   <input type="range" min="0" max="${a.max}" step="5" id="c${i}"></div>
+  <div class="row"><label>Speed <span class="val" id="sv${i}"></span> Hz</label>
+   <input type="range" min="${S.spdMin}" max="${S.spdMax}" step="10" id="s${i}"></div>
+  <div class="row"><label>Acceleration <span class="val" id="av${i}"></span> st/s²</label>
+   <input type="range" min="${S.accMin}" max="${S.accMax}" step="100" id="a${i}"></div>
+  <div class="row"><label>Microsteps</label><select id="m${i}">${MS.map(x=>`<option>${x}</option>`).join('')}</select></div>
+  <h3>Mode</h3>
+  <div class="row"><label>Direction</label><div class="toggle"><button id="d${i}0">CW</button><button id="d${i}1">CCW</button></div></div>
+  <div class="row"><label>Chopper (spread = more torque)</label><div class="toggle"><button id="p${i}0">stealth</button><button id="p${i}1">spread</button></div></div>
+  <div class="row"><label>Driver — must be ON to move</label><div class="toggle"><button id="e${i}0">OFF</button><button id="e${i}1" class="enbtn">ON</button></div></div>
+  <h3>Run</h3>
+  <div class="row"><label>Move a set number of turns</label>
+   <input type="number" id="t${i}" min="${S.turnMin}" max="${S.turnMax}" step="0.25" value="1"> turns
+   <div class="btns"><button class="run" id="rt${i}">▶ Run turns</button>
+    <button class="run" id="sp${i}">∞ Spin</button><button class="stop" id="st${i}">■ Stop</button></div></div>
+ </div>`;}
+function wire(a){const i=a.n;
+ const c=gid('c'+i),cv=gid('cv'+i);c.value=a.cur;cv.textContent=a.cur;
+ c.oninput=()=>{cv.textContent=c.value;deb(c,()=>api(`/set?axis=${i}&field=current&value=${c.value}`));};
+ const s=gid('s'+i),sv=gid('sv'+i);s.value=a.spd;sv.textContent=a.spd;
+ s.oninput=()=>{sv.textContent=s.value;deb(s,()=>api(`/set?axis=${i}&field=speed&value=${s.value}`));};
+ const ac=gid('a'+i),av=gid('av'+i);ac.value=a.acc;av.textContent=a.acc;
+ ac.oninput=()=>{av.textContent=ac.value;deb(ac,()=>api(`/set?axis=${i}&field=accel&value=${ac.value}`));};
+ gid('m'+i).value=a.mic;gid('m'+i).onchange=e=>api(`/set?axis=${i}&field=micro&value=${e.target.value}`);
+ bind(i,'d','dir',a.dir);bind(i,'p','spread',a.spread);bind(i,'e','enabled',a.en);
+ gid('rt'+i).onclick=()=>api(`/run?axis=${i}&turns=${gid('t'+i).value}`);
+ gid('sp'+i).onclick=()=>api(`/run?axis=${i}&mode=spin`);
+ gid('st'+i).onclick=()=>api(`/stop?axis=${i}`);
+}
+function bind(i,p,f,v){const b0=gid(p+i+'0'),b1=gid(p+i+'1');
+ act(v?b1:b0, v?b0:b1);
+ b0.onclick=()=>{api(`/set?axis=${i}&field=${f}&value=0`);act(b0,b1);};
+ b1.onclick=()=>{api(`/set?axis=${i}&field=${f}&value=1`);act(b1,b0);};}
+function gid(x){return document.getElementById(x);}
+function deb(el,fn){clearTimeout(el._t);el._t=setTimeout(fn,120);}
+function toggleSettings(){const e=gid('settings');e.style.display=e.style.display=='none'||!e.style.display?'block':'none';}
+function saveSettings(){
+ const q=new URLSearchParams();
+ ['cur','spd','acc','turn'].forEach(k=>{q.set(k+'Min',gid(k+'Min').value);q.set(k+'Max',gid(k+'Max').value);});
+ q.set('spr',gid('spr').value);
+ AX.forEach(a=>q.set('ax'+a.n,gid('ax'+a.n).checked?1:0));
+ api('/settings?'+q.toString()).then(()=>load());
+}
+function load(){fetch('/state').then(r=>r.json()).then(d=>{S=d.set;AX=d.ax;VAC=d.vac;YLINK=d.ylink;render();});}
+load();
+
+// ---------- Xbox / Gamepad control ----------
+let GP=null, learn=null;
+let gpMap=JSON.parse(localStorage.getItem('pnpGpMap')||'{}'); gpMap.ax=gpMap.ax||{}; gpMap.btn=gpMap.btn||{};
+let macros=JSON.parse(localStorage.getItem('pnpMacros')||'{}');
+const ACTIONS=[['stopAll','STOP ALL'],['vacL','Vacuum L toggle'],['vacR','Vacuum R toggle'],['m1go','Go Macro 1'],['m2go','Go Macro 2'],['m3go','Go Macro 3'],['zero','Zero all']];
+const SCH_DEF={xy:{fast:3000,slow:200,dz:0.18,micro:16,accel:20000,invX:false,invY:true},z:{fast:1500,slow:150,dz:0.12,micro:16,accel:15000,invert:false},c:{fast:2000,slow:150,dz:0.18,micro:16,accel:15000,invert:false}};
+let scheme=JSON.parse(localStorage.getItem('pnpScheme')||'{}');
+scheme.xy=Object.assign({},SCH_DEF.xy,scheme.xy);scheme.z=Object.assign({},SCH_DEF.z,scheme.z);scheme.c=Object.assign({},SCH_DEF.c,scheme.c);
+let flight=localStorage.getItem('pnpFlight')==='1', cActive='C1', prevA=false, prevLB=false, prevRB=false, paused=false;
+function saveSch(){localStorage.setItem('pnpScheme',JSON.stringify(scheme));}
+function grp(g,label,extra){const o=scheme[g];return `<h3>${label}</h3><div class="row">fast <input type="number" class="sc" data-g="${g}" data-k="fast" value="${o.fast}" style="width:80px"> Hz &nbsp; slow <input type="number" class="sc" data-g="${g}" data-k="slow" value="${o.slow}" style="width:70px"> Hz &nbsp; deadzone <input type="number" step="0.05" class="sc" data-g="${g}" data-k="dz" value="${o.dz}" style="width:60px"> &nbsp; µsteps <select class="sc" data-g="${g}" data-k="micro">${MS.map(x=>`<option ${o.micro==x?'selected':''}>${x}</option>`).join('')}</select> &nbsp; accel <input type="number" class="sc" data-g="${g}" data-k="accel" value="${o.accel}" style="width:90px"> st/s² &nbsp; ${extra}</div>`;}
+function schemeHtml(){return grp('xy','Left stick → X (horizontal) / Y0+Y1 (vertical)',`<label><input type="checkbox" class="sc" data-g="xy" data-k="invX" ${scheme.xy.invX?'checked':''}>invX</label> <label><input type="checkbox" class="sc" data-g="xy" data-k="invY" ${scheme.xy.invY?'checked':''}>invY</label>`)+grp('z','Triggers → Z  (RT = up, LT = down)',`<label><input type="checkbox" class="sc" data-g="z" data-k="invert" ${scheme.z.invert?'checked':''}>invert</label>`)+grp('c','Right stick → C0 / C1  (A switches)',`<label><input type="checkbox" class="sc" data-g="c" data-k="invert" ${scheme.c.invert?'checked':''}>invert</label>`);}
+function applyScheme(){const push=(ns,g)=>ns.forEach(n=>{api(`/set?axis=${n}&field=micro&value=${scheme[g].micro}`);api(`/set?axis=${n}&field=accel&value=${scheme[g].accel}`);});push(['X','Y0','Y1'],'xy');push(['Z'],'z');push(['C0','C1'],'c');}
+function qhz(v,cfg){const a=Math.abs(v);if(a<cfg.dz)return 0;const t=(a-cfg.dz)/(1-cfg.dz);return Math.max(cfg.slow,Math.round((cfg.slow+t*(cfg.fast-cfg.slow))/50)*50);}
+function fjog(name,v,cfg,inv){let vv=inv?-v:v;const hz=qhz(vv,cfg);const dir=hz===0?0:(vv>0?1:-1);const key=dir+':'+hz;if(lastJog[name]!==key){jog(name,dir,hz);lastJog[name]=key;}}
+function fjogPair(ns,v,cfg,inv){let vv=inv?-v:v;const hz=qhz(vv,cfg);const dir=hz===0?0:(vv>0?1:-1);const key=dir+':'+hz;if(lastJog['Yp']!==key){ns.forEach(n=>jog(n,dir,hz));lastJog['Yp']=key;}}
+function flightPoll(gp){const c0=Math.abs(gp.axes[0]||0),c1=Math.abs(gp.axes[1]||0),c2=Math.abs(gp.axes[2]||0),trg=(gp.buttons[6]?gp.buttons[6].value:0)+(gp.buttons[7]?gp.buttons[7].value:0);if(paused){if(c0<0.25&&c1<0.25&&c2<0.25&&trg<0.15)paused=false;else return;}fjog('X',gp.axes[0]||0,scheme.xy,scheme.xy.invX);fjogPair(['Y0','Y1'],gp.axes[1]||0,scheme.xy,scheme.xy.invY);const rt=gp.buttons[7]?gp.buttons[7].value:0,lt=gp.buttons[6]?gp.buttons[6].value:0;fjog('Z',rt-lt,scheme.z,scheme.z.invert);fjog(cActive,gp.axes[2]||0,scheme.c,scheme.c.invert);const aNow=gp.buttons[0]&&(gp.buttons[0].pressed||gp.buttons[0].value>0.5);if(aNow&&!prevA){const old=cActive;cActive=(cActive==='C1')?'C0':'C1';jog(old,0,0);lastJog[old]='x';const ce=gid('cact');if(ce)ce.textContent=cActive;status.textContent='C stick → '+cActive;}prevA=aNow;const lb=gp.buttons[4]&&gp.buttons[4].pressed;if(lb&&!prevLB)doAction('vacL');prevLB=lb;const rb=gp.buttons[5]&&gp.buttons[5].pressed;if(rb&&!prevRB)doAction('vacR');prevRB=rb;}
+function saveGp(){localStorage.setItem('pnpGpMap',JSON.stringify(gpMap));}
+function saveMac(){localStorage.setItem('pnpMacros',JSON.stringify(macros));}
+function toggleGp(){const e=gid('gppanel');e.style.display=(e.style.display=='none'||!e.style.display)?'block':'none';if(e.style.display=='block')renderGp();}
+addEventListener('gamepadconnected',e=>{GP=e.gamepad.index;renderGp();});
+addEventListener('gamepaddisconnected',()=>{GP=null;renderGp();});
+
+function renderGp(){
+ const el=gid('gppanel'); if(!el) return;
+ const pads=navigator.getGamepads?navigator.getGamepads():[];
+ const gp=GP!=null?pads[GP]:null;
+ const names=AX.filter(a=>a.active).map(a=>a.n);
+ let h=`<h2 style="margin:4px 0">Xbox controller</h2>
+  <div style="color:#9aa0aa;margin-bottom:10px">${gp?('✓ '+gp.id):'Not connected — plug in / pair your controller and press any button.'}</div>`;
+ if(gp){
+  h+=`<div class="row"><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="flight" ${flight?'checked':''}> <b>PNP flight mode</b> — L-stick = X/Y gantry · triggers = Z · R-stick = C0/C1 (A switches) · LB/RB = vacuums</label></div>`;
+  if(flight){
+   h+=schemeHtml();
+   h+=`<div class="row">Right stick driving: <b id="cact">${cActive}</b>  (press <b>A</b> to switch)</div>`;
+   h+=`<div style="color:#9aa0aa;font-size:12px;margin:6px 0">Activate X, Y0, Y1, Z, C0, C1 in ⚙ Settings. Turning flight ON enables their drivers.</div>`;
+  } else {
+   h+=`<h3>Analog jog — sticks & triggers</h3>`;
+   for(let i=0;i<gp.axes.length;i++){const m=gpMap.ax[i]||{};
+    h+=`<div class="row">Axis ${i}
+     <select class="gpd" data-i="${i}"><option value="">—none—</option>${names.map(n=>`<option ${m.dest===n?'selected':''}>${n}</option>`).join('')}</select>
+     max <input type="number" class="gps" data-i="${i}" value="${m.scale||2000}" style="width:76px"> Hz
+     dz <input type="number" step="0.05" class="gpz" data-i="${i}" value="${m.dz||0.15}" style="width:58px">
+     <label><input type="checkbox" class="gpi" data-i="${i}" ${m.inv?'checked':''}>inv</label></div>`;}
+  }
+  h+=`<h3>Buttons & triggers → actions</h3>`;
+  h+=ACTIONS.map(a=>`<div class="row">${a[1]}: <b>${gpMap.btn[a[0]]||'(unbound)'}</b>
+    <button class="gpl" data-a="${a[0]}">${learn===a[0]?'press control…':'Learn'}</button></div>`).join('');
+  h+=`<h3>Macros — saved positions</h3>`;
+  h+=[1,2,3].map(s=>`<div class="row">Macro ${s}: <span style="color:#9aa0aa">${macros[s]?Object.entries(macros[s]).map(([k,v])=>k+'='+v).join(', '):'empty'}</span>
+    <button class="gpm" data-s="${s}">Save current</button></div>`).join('');
+ }
+ el.innerHTML=h;
+ el.querySelectorAll('.gpd').forEach(x=>x.onchange=e=>{let i=e.target.dataset.i;(gpMap.ax[i]=gpMap.ax[i]||{}).dest=e.target.value;saveGp();});
+ el.querySelectorAll('.gps').forEach(x=>x.onchange=e=>{let i=e.target.dataset.i;(gpMap.ax[i]=gpMap.ax[i]||{}).scale=+e.target.value;saveGp();});
+ el.querySelectorAll('.gpz').forEach(x=>x.onchange=e=>{let i=e.target.dataset.i;(gpMap.ax[i]=gpMap.ax[i]||{}).dz=+e.target.value;saveGp();});
+ el.querySelectorAll('.gpi').forEach(x=>x.onchange=e=>{let i=e.target.dataset.i;(gpMap.ax[i]=gpMap.ax[i]||{}).inv=e.target.checked;saveGp();});
+ el.querySelectorAll('.gpl').forEach(x=>x.onclick=e=>{learn=e.target.dataset.a;renderGp();});
+ el.querySelectorAll('.gpm').forEach(x=>x.onclick=e=>saveMacro(e.target.dataset.s));
+ el.querySelectorAll('.sc').forEach(x=>x.onchange=e=>{const g=e.target.dataset.g,k=e.target.dataset.k;scheme[g][k]=e.target.type==='checkbox'?e.target.checked:+e.target.value;saveSch();if(k==='micro'||k==='accel')applyScheme();});
+ const fl=gid('flight'); if(fl) fl.onchange=e=>{flight=e.target.checked;localStorage.setItem('pnpFlight',flight?'1':'0');lastJog={};['X','Y0','Y1','Z','C0','C1'].forEach(n=>jog(n,0,0));if(flight){applyScheme();['X','Y0','Y1','Z','C0','C1'].forEach(n=>api(`/set?axis=${n}&field=enabled&value=1`));}renderGp();};
+}
+function jog(n,dir,hz){api(`/jog?axis=${n}&dir=${dir}&hz=${hz}`);}
+function saveMacro(s){fetch('/state').then(r=>r.json()).then(d=>{const m={};d.ax.forEach(a=>{if(a.active)m[a.n]=a.pos;});macros[s]=m;saveMac();renderGp();});}
+function gotoMacro(s){const m=macros[s];if(!m)return;Object.keys(m).forEach(n=>api(`/goto?axis=${n}&pos=${m[n]}`));}
+function doAction(a){
+ if(a==='stopAll')api('/stopall');
+ else if(a==='vacL'){VAC.l=VAC.l?0:1;api('/vac?side=left&on='+VAC.l);}
+ else if(a==='vacR'){VAC.r=VAC.r?0:1;api('/vac?side=right&on='+VAC.r);}
+ else if(a==='zero')api('/zero?axis=all');
+ else if(a[0]==='m')gotoMacro(a[1]);
+}
+let prevB=[], lastJog={};
+function poll(){requestAnimationFrame(poll);
+ const pads=navigator.getGamepads?navigator.getGamepads():[]; const gp=GP!=null?pads[GP]:null; if(!gp)return;
+ if(learn){for(let i=0;i<gp.buttons.length;i++){if(gp.buttons[i].pressed||gp.buttons[i].value>0.5){gpMap.btn[learn]='b'+i;learn=null;saveGp();renderGp();return;}}}
+ if(flight){flightPoll(gp);}
+ else{Object.keys(gpMap.ax).forEach(i=>{const m=gpMap.ax[i];if(!m||!m.dest)return;
+  let v=gp.axes[i]||0; if(m.inv)v=-v; const dz=m.dz||0.15; const n=m.dest;
+  if(Math.abs(v)<dz){if(lastJog[n]!==0){jog(n,0,0);lastJog[n]=0;}return;}
+  const hz=Math.max(200,Math.round(Math.abs(v)*(m.scale||2000)/200)*200); const dir=v>0?1:-1; const key=dir+':'+hz;
+  if(lastJog[n]!==key){jog(n,dir,hz);lastJog[n]=key;}});}
+ for(let i=0;i<gp.buttons.length;i++){const p=gp.buttons[i].pressed||gp.buttons[i].value>0.5;
+  if(p&&!prevB[i]){Object.keys(gpMap.btn).forEach(act=>{if(gpMap.btn[act]==='b'+i)doAction(act);});}
+  prevB[i]=p;}
+}
+{const es=gid('estop'); if(es) es.onclick=()=>{api('/stopall');paused=true;lastJog={};status.textContent='STOP ALL — flight paused until sticks re-center';};}
+poll();
+</script></body></html>
