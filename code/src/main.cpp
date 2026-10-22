@@ -21,11 +21,18 @@
 #include <FastAccelStepper.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
 #include <Preferences.h>
+#include "wifi_secrets.h"
 
-// ---- WiFi AP ----
-static constexpr char AP_SSID[] = "PNP-Control";
-static constexpr char AP_PASS[] = "pnp12345";   // >= 8 chars
+// ---- WiFi ----
+// Joins your network (WIFI_SSID/WIFI_PASS from wifi_secrets.h). If it can't
+// connect within the timeout, it falls back to its own AP so you're never
+// locked out. OTA (over-the-air) firmware updates are enabled either way.
+static constexpr char AP_SSID[] = "PNP-Control";   // fallback AP name
+static constexpr char AP_PASS[] = "pnp12345";      // fallback AP pass (>= 8 chars)
+static constexpr uint32_t WIFI_JOIN_TIMEOUT_MS = 12000;
+static constexpr char OTA_HOSTNAME[] = "pnp";
 
 // ---- UART buses ----
 static constexpr int      PIN_UART_A = 8;        // C1, Z, X
@@ -631,9 +638,30 @@ void setup() {
     applyDriver(a);                           // boots with driverOn default + speed 0 => no motion
   }
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.printf("WiFi AP '%s' -> http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  // Try to join your network; fall back to our own AP if it doesn't connect.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Joining WiFi '%s' ...\n", WIFI_SSID);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_JOIN_TIMEOUT_MS) delay(250);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Connected -> http://%s\n", WiFi.localIP().toString().c_str());
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    Serial.printf("Join failed; AP '%s' -> http://%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  }
+
+  // Over-the-air firmware updates (password-protected).
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASS);
+  ArduinoOTA.onStart([]() {                 // stop all motion before reflashing
+    for (int i = 0; i < NAX; i++) { if (axes[i].fs) axes[i].fs->forceStop(); }
+    digitalWrite(PIN_EN, HIGH);
+    digitalWrite(PIN_VAC_LEFT, LOW); digitalWrite(PIN_VAC_RIGHT, LOW);
+  });
+  ArduinoOTA.begin();
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/state", HTTP_GET, handleState);
@@ -652,4 +680,5 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  ArduinoOTA.handle();
 }

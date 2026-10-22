@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local WiFi/OTA credentials — never commit
+include/wifi_secrets.h
+ui-preview.html
