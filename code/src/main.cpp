@@ -1,5 +1,5 @@
 /*
- * PNP board — 5-axis TMC2209 tuning + turn-test panel over WiFi.
+ * PNP board — 6-axis TMC2209 tuning + turn-test panel over WiFi.
  *
  * Target: ESP32-S3-DevKitC (on the PNP PCB)
  *
@@ -9,8 +9,8 @@
  *
  * Axes (traced from PNP.kicad_pcb). EN = GPIO48 (global, held low; per-axis on/off
  * via TMC `toff`). Two UART buses; address set by each socket's MS1/MS2 straps:
- *   Bus A = GPIO8  (1k series R):  C1=addr1(step6,dir5)  Z=addr0(step10,dir9)  X=addr2(step13,dir14)
- *   Bus B = GPIO39 (1k series R):  Y0=addr2(step2,dir1)  Y1=addr1(step47,dir21)
+ *   Bus A RX=GPIO8, TX=GPIO18 (1k series R):  C1=addr1(step6,dir5)  Z=addr0(step10,dir9)  X=addr2(step13,dir14)
+ *   Bus B RX=GPIO39, TX=GPIO40 (1k series R): Y0=addr2(step2,dir1) Y1=addr1(step47,dir21) C0=addr0(step41,dir42)
  *
  * Step/dir pulses: FastAccelStepper (hardware-timed, with acceleration + bounded
  * "move N turns"). Current/microstep/chopper: TMC2209 over UART.
@@ -23,6 +23,9 @@
 #include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <limits.h>
+#include <errno.h>
+#include <WebSocketsServer.h>
 #include "wifi_secrets.h"
 
 // ---- WiFi ----
@@ -35,6 +38,8 @@ static constexpr uint32_t WIFI_JOIN_TIMEOUT_MS = 12000;
 static constexpr char OTA_HOSTNAME[] = "pnp";
 
 // ---- UART buses ----
+static constexpr int      PIN_UART_TX_A = 18;
+static constexpr int      PIN_UART_TX_B = 40;
 static constexpr int      PIN_UART_A = 8;        // C1, Z, X
 static constexpr int      PIN_UART_B = 39;       // Y0, Y1
 static constexpr uint32_t UART_BAUD  = 115200;
@@ -85,12 +90,12 @@ struct Axis {
 #define NAX 6
 Axis axes[NAX] = {
   //name  drv     step dir  fs  active cur   max   spd acc   mic sprd dir  on  conn   motor (rated peak/phase)
-  {"C1", &drvC1,  6,   5,   nullptr, true,  340,  424, 0, 2000, 16, true, true, false, 0}, // Nema8 hollow 0.6A
-  {"Z",  &drvZ,  10,   9,   nullptr, true,  1200, 1485, 0, 2000, 16, true, true, false, 0}, // Nema17 2.1A
-  {"X",  &drvX,  13,  14,   nullptr, false, 1200, 1485, 0, 2000, 16, true, true, false, 0}, // Nema17 2.1A
-  {"Y0", &drvY0,  2,   1,   nullptr, false, 1200, 1485, 0, 2000, 16, true, true, false, 0}, // Nema17 2.1A
-  {"Y1", &drvY1, 47,  21,   nullptr, false, 1200, 1485, 0, 2000, 16, true, true, false, 0}, // Nema17 2.1A
-  {"C0", &drvC0, 41,  42,   nullptr, false, 340,  424, 0, 2000, 16, true, true, false, 0}, // Nema8 hollow 0.6A
+  {"C1", &drvC1,  6,   5,   nullptr, true,  340,  424, 0, 2000, 1, true, true, false, 0}, // Nema8 hollow 0.6A
+  {"Z",  &drvZ,  10,   9,   nullptr, true,  1200, 1485, 0, 2000, 1, true, true, false, 0}, // Nema17 2.1A
+  {"X",  &drvX,  13,  14,   nullptr, false, 1200, 1485, 0, 2000, 1, true, true, false, 0}, // Nema17 2.1A
+  {"Y0", &drvY0,  2,   1,   nullptr, false, 1200, 1485, 0, 2000, 1, true, true, false, 0}, // Nema17 2.1A
+  {"Y1", &drvY1, 47,  21,   nullptr, false, 1200, 1485, 0, 2000, 1, true, true, false, 0}, // Nema17 2.1A
+  {"C0", &drvC0, 41,  42,   nullptr, false, 340,  424, 0, 2000, 1, true, true, false, 0}, // Nema8 hollow 0.6A
 };
 
 // ---- Global settings (slider ranges etc.), persisted to NVS ----
@@ -105,6 +110,7 @@ Settings cfg = {0, 1500, 0, 4000, 100, 50000, 0, 100, 200};
 
 Preferences prefs;
 WebServer server(80);
+WebSocketsServer controlSocket(81);
 
 // ---- Persistence ----
 static void loadSettings() {
@@ -143,6 +149,7 @@ static void connectStepper(Axis& a) {
   a.fs = engine.stepperConnectToPin(a.stepPin);
   if (a.fs) {
     a.fs->setDirectionPin(a.dirPin);
+    a.fs->setForwardPlanningTimeInMs(10); // 5 task cycles of margin at 2 ms
     a.fs->setAutoEnable(false);          // EN is shared, managed manually
     a.fs->setAcceleration(a.accel);
     a.fs->setSpeedInHz(max<uint32_t>(a.speed_hz, 1));
@@ -151,6 +158,7 @@ static void connectStepper(Axis& a) {
 
 static void initDriver(TMC2209Stepper* d) {
   d->begin();
+  d->VACTUAL(0);             // use external STEP/DIR, never internal velocity mode
   d->pdn_disable(true);
   d->I_scale_analog(false);   // ignore VREF pot; current is software-defined
   d->mstep_reg_select(true);
@@ -160,21 +168,37 @@ static void initDriver(TMC2209Stepper* d) {
 // Push current/microstep/chopper/enable to the TMC.
 static void applyDriver(Axis& a) {
   a.drv->rms_current(a.current_mA);
-  a.drv->microsteps(a.microsteps);
+  a.drv->microsteps(a.microsteps == 1 ? 0 : a.microsteps);
   a.drv->en_spreadCycle(a.spread);
   a.drv->toff(a.driverOn ? 4 : 0);
+}
+
+static bool validMicrosteps(long v) {
+  return v >= 1 && v <= 256 && (v & (v - 1)) == 0;
+}
+
+static uint32_t turnSpeed(const Axis& a) {
+  return a.speed_hz < 50 ? 400 : a.speed_hz;
+}
+
+// forceStop() drains queued commands and can remain stuck in a failed backend.
+// Flush the hardware queue for an explicit stop; an abrupt stop loses exact position.
+static void stopAxis(Axis& a) {
+  if (a.fs) a.fs->forceStopAndNewPosition(a.fs->getCurrentPosition());
+  a.spinning = false;
 }
 
 static int32_t turnsToSteps(float turns, const Axis& a) {
   return (int32_t)lround(turns * (float)cfg.stepsPerRev * (float)a.microsteps);
 }
 
-static void spinContinuous(Axis& a) {
-  if (!a.fs || !a.driverOn || a.speed_hz < 1) { if (a.fs) a.fs->stopMove(); a.spinning = false; return; }
+static int8_t spinContinuous(Axis& a) {
+  if (!a.fs || !a.driverOn || a.speed_hz < 1) { if (a.fs) a.fs->stopMove(); a.spinning = false; return -1; }
   a.fs->setAcceleration(a.accel);
   a.fs->setSpeedInHz(a.speed_hz);
-  if (a.dir) a.fs->runForward(); else a.fs->runBackward();
-  a.spinning = true;
+  int8_t result = a.dir ? a.fs->runForward() : a.fs->runBackward();
+  a.spinning = result == MOVE_OK;
+  return result;
 }
 
 // Re-apply speed/direction to a motor that is ALREADY spinning — never starts it.
@@ -184,23 +208,232 @@ static void adjustIfSpinning(Axis& a) {
   if (a.dir) a.fs->runForward(); else a.fs->runBackward();
 }
 
-static void runTurns(Axis& a, float turns) {
-  if (!a.fs || !a.driverOn) return;
-  a.spinning = false;
+static int8_t runTurns(Axis& a, float turns) {
+  if (!a.fs || !a.driverOn) return -1;
+  // A turns command replaces any prior motion, starting from the current position.
+  stopAxis(a);
   a.fs->setAcceleration(a.accel);
   // If no usable speed is set, run the move at a sane default instead of
   // crawling at 1 Hz (which looks like it never finishes).
-  a.fs->setSpeedInHz(a.speed_hz < 50 ? 400 : a.speed_hz);
+  a.fs->setSpeedInHz(turnSpeed(a));
   int32_t steps = turnsToSteps(turns, a);
   if (!a.dir) steps = -steps;
-  a.fs->move(steps);
+  return a.fs->move(steps);
+}
+
+// One latest controller frame drives every axis; no per-axis HTTP queue.
+static uint8_t controllerSocketOwner = 255;
+static bool controllerArmed = false, controllerPrimed = false;
+static uint32_t controllerEpoch = 1, controllerLastFrame = 0;
+static constexpr uint32_t CONTROLLER_TIMEOUT_MS = 600;
+static int32_t controllerHz[NAX] = {};
+static long controllerDesiredHz[NAX] = {};
+static uint32_t controllerAccel16[NAX] = {};
+static bool controllerPrecision = false, controllerModeChanging = false;
+
+static void releaseController(bool disableDrivers = false) {
+  controllerArmed = false; controllerPrimed = false; controllerModeChanging = false;
+  controllerSocketOwner = 255;
+  ++controllerEpoch;  // queued frames from a previous enable can never restart motion
+  for (int i = 0; i < NAX; ++i) {
+    stopAxis(axes[i]); controllerHz[i] = 0;
+    if (disableDrivers) { axes[i].driverOn = false; axes[i].drv->toff(0); }
+  }
+}
+
+static bool integerArg(const char* key, long low, long high, long& value) {
+  const String raw = server.arg(key);
+  char* end = nullptr;
+  errno = 0;
+  value = strtol(raw.c_str(), &end, 10);
+  return errno != ERANGE && raw.length() && end != raw.c_str() && *end == '\0' && value >= low && value <= high;
+}
+
+static bool controllerResolution(bool precision) {
+  const uint16_t micro = precision ? 16 : 1;
+  int32_t positions[NAX];
+  for (int i = 0; i < NAX; ++i) {
+    const auto& a = axes[i];
+    if (!a.fs || a.fs->isRunning()) return false;
+    const int64_t scaled = (int64_t)a.fs->getCurrentPosition() * micro / a.microsteps;
+    if (scaled < INT32_MIN || scaled > INT32_MAX) return false;
+    positions[i] = (int32_t)scaled;
+  }
+  for (int i = 0; i < NAX; ++i) {
+    auto& a = axes[i];
+    a.drv->microsteps(micro == 1 ? 0 : micro);
+    a.fs->setCurrentPosition(positions[i]);
+    a.microsteps = micro;
+    a.accel = max<uint32_t>(1, controllerAccel16[i] * micro / 16);
+    a.fs->setAcceleration(a.accel);
+  }
+  controllerPrecision = precision;
+  return true;
+}
+
+static void handleController() {
+  if (server.arg("action") == "stop") {
+    releaseController(true);
+    server.send(200, "application/json", "{\"armed\":0}"); return;
+  }
+  if (server.arg("action") != "arm") {
+    server.send(400, "text/plain", "Unknown controller action"); return;
+  }
+  long micro[3], accel[3];
+  const char* mk[] = {"mxy", "mz", "mc"};
+  const char* ak[] = {"axy", "az", "ac"};
+  for (int g = 0; g < 3; ++g) {
+    if (!integerArg(mk[g], 1, 256, micro[g]) || micro[g] != 1 ||
+        !integerArg(ak[g], 100, cfg.accMax, accel[g])) {
+      server.send(400, "text/plain", "Invalid controller microsteps or acceleration"); return;
+    }
+  }
+  releaseController(true);
+  digitalWrite(PIN_EN, HIGH);
+  // Prepare all axes before enabling any of them. Current limits are unchanged.
+  for (int i = 0; i < NAX; ++i) {
+    auto& a = axes[i];
+    const int g = (i == 0 || i == 5) ? 2 : (i == 1 ? 1 : 0);
+    a.active = true; connectStepper(a); initDriver(a.drv);
+    a.conn = a.drv->test_connection();
+    if (!a.fs || a.conn != 0) {
+      releaseController(true);
+      server.send(409, "text/plain", String(a.name) + ": controller setup failed"); return;
+    }
+    controllerAccel16[i] = accel[g];
+    // Microsteps are set for all axes together below, while stopped.
+    a.accel = max<uint32_t>(1, accel[g] / 16);
+    a.fs->setAcceleration(a.accel); applyDriver(a);
+  }
+  if (!controllerResolution(false)) {
+    releaseController(true); server.send(409, "text/plain", "Cannot set full-step mode"); return;
+  }
+  for (auto& a : axes) { a.driverOn = true; a.drv->toff(4); }
+  digitalWrite(PIN_EN, LOW);
+  controllerArmed = true; controllerLastFrame = millis();
+  server.send(200, "application/json", "{\"armed\":1,\"epoch\":" + String(controllerEpoch) + "}");
+}
+
+static const char* applyControlSpeeds(const long requested[NAX], bool precision = false) {
+  // Setup uses HTTP; allow its reply to arrive before the first neutral handshake.
+  if (!controllerPrimed) {
+    for (int i = 0; i < NAX; ++i) if (requested[i] != 0) {
+      releaseController(); return "Center controls before starting the controller";
+    }
+    controllerPrimed = true;
+  }
+  for (const auto& a : axes)
+    if (!a.active || !a.driverOn || !a.fs) { releaseController(); return "Controller axis unavailable"; }
+  for (int i = 0; i < NAX; ++i) controllerDesiredHz[i] = requested[i];
+  controllerLastFrame = millis();
+  if (precision != controllerPrecision) {
+    if (!controllerModeChanging) {
+      for (int i = 0; i < NAX; ++i) { axes[i].fs->stopMove(); controllerHz[i] = 0; }
+      controllerModeChanging = true;
+    }
+    return nullptr;
+  }
+  // Releasing X before the stop completes cancels the resolution change.
+  controllerModeChanging = false;
+  for (int i = 0; i < NAX; ++i) {
+    auto& a = axes[i]; const int32_t hz = requested[i], old = controllerHz[i];
+    if (hz == old) continue;
+    a.spinning = false;
+    if (hz == 0) a.fs->stopMove();
+    else {
+      a.fs->setSpeedInHz(abs(hz));
+      int8_t result = MOVE_OK;
+      if ((hz > 0 && old > 0) || (hz < 0 && old < 0)) {
+        // Update speed without repeatedly restarting the continuous ramp.
+        a.fs->applySpeedAcceleration();
+      } else result = hz > 0 ? a.fs->runForward() : a.fs->runBackward();
+      if (result != MOVE_OK) {
+        releaseController(); return "Controller move rejected";
+      }
+    }
+    controllerHz[i] = hz;
+  }
+  controllerLastFrame = millis();
+  return nullptr;
+}
+
+// Drain the pulse queues before changing UART microstep resolution.
+// The latest incoming frame remains cached, so held sticks resume after the change.
+static void serviceControllerResolution() {
+  if (!controllerArmed || !controllerModeChanging) return;
+  for (const auto& a : axes) if (a.fs->isRunning()) return;
+  if (!controllerResolution(!controllerPrecision)) { releaseController(); return; }
+  controllerModeChanging = false;
+  if (applyControlSpeeds(controllerDesiredHz, controllerPrecision)) releaseController();
+}
+
+static void handleControlFrame() {
+  server.client().setNoDelay(true);
+  long epoch;
+  if (!integerArg("epoch", 1, LONG_MAX, epoch) || !controllerArmed || (uint32_t)epoch != controllerEpoch) {
+    server.send(409, "text/plain", "Controller disabled; enable it again"); return;
+  }
+  const char* keys[NAX] = {"c1", "z", "x", "y", "y", "c0"};
+  long requested[NAX];
+  // Validate the complete frame before touching a motor.
+  for (int i = 0; i < NAX; ++i) {
+    if (!integerArg(keys[i], -(long)cfg.spdMax, cfg.spdMax, requested[i])) {
+      releaseController(); server.send(400, "text/plain", "Invalid controller speed"); return;
+    }
+    if (!axes[i].active || !axes[i].driverOn || !axes[i].fs) {
+      releaseController(); server.send(409, "text/plain", "Controller axis unavailable"); return;
+    }
+  }
+  long precision = 0;
+  if (server.hasArg("precision") && !integerArg("precision", 0, 1, precision)) {
+    releaseController(); server.send(400, "text/plain", "Invalid precision mode"); return;
+  }
+  const char* error = applyControlSpeeds(requested, precision != 0);
+  if (error) server.send(409, "text/plain", error);
+  else server.send(200, "application/json", "{\"ok\":1}");
+}
+
+static void controlSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_DISCONNECTED) {
+    if (client == controllerSocketOwner) releaseController();
+    return;
+  }
+  if (type != WStype_TEXT) return;
+  // CSV frame: sequence, epoch, X, Y pair, Z, C0, C1, precision. Bounded, exact parse.
+  long fields[8];
+  bool valid = length > 0 && length < 96;
+  char buffer[96];
+  if (valid) { memcpy(buffer, payload, length); buffer[length] = '\0'; }
+  char* next = buffer;
+  for (int i = 0; valid && i < 8; ++i) {
+    char* end = nullptr; errno = 0;
+    fields[i] = strtol(next, &end, 10);
+    const long low = i < 2 ? 1 : (i == 7 ? 0 : -(long)cfg.spdMax);
+    const long high = i < 2 ? LONG_MAX : (i == 7 ? 1 : cfg.spdMax);
+    valid = errno != ERANGE && end != next && fields[i] >= low && fields[i] <= high &&
+            (i < 7 ? *end == ',' : end == buffer + length);
+    next = end + (i < 7 ? 1 : 0);
+  }
+  if (!valid) {
+    if (client == controllerSocketOwner) releaseController();
+    controlSocket.sendTXT(client, "{\"error\":\"Invalid controller frame\"}"); return;
+  }
+  if (!controllerArmed || (uint32_t)fields[1] != controllerEpoch) {
+    controlSocket.sendTXT(client, "{\"error\":\"Controller disabled; enable it again\"}"); return;
+  }
+  const long requested[NAX] = {fields[6], fields[4], fields[2], fields[3], fields[3], fields[5]};
+  const char* error = applyControlSpeeds(requested, fields[7] != 0);
+  if (error) { controlSocket.sendTXT(client, String("{\"error\":\"") + error + "\"}"); return; }
+  controllerSocketOwner = client;
+  controlSocket.sendTXT(client, String("{\"ok\":1,\"seq\":") + fields[0] + "}");
 }
 
 // ---- Web UI ----
 static const char PAGE[] PROGMEM = R"rawhtml(
 <!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PNP Driver Tuner</title>
+<title>PNP Controller</title>
+<link rel="icon" href="data:,">
 <style>
  :root{color-scheme:dark}
  body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#0f1115;color:#e6e6e6}
@@ -230,24 +463,23 @@ static const char PAGE[] PROGMEM = R"rawhtml(
  .sgrid .h{color:#9aa0aa;font-size:12px}
  .axlist{display:flex;flex-wrap:wrap;gap:12px;margin:10px 0}
  .axlist label{display:flex;align-items:center;gap:6px;color:#e6e6e6}
+ *{box-sizing:border-box}button{min-height:44px}button:disabled{opacity:.45;cursor:not-allowed}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid #93b5ff;outline-offset:3px}header{position:sticky;top:0;z-index:10;gap:12px}header b{font-size:17px}.topstop{background:#b23b3b;color:#fff;font-weight:700;min-width:130px}.page{max-width:1140px;margin:auto;padding:24px 20px 40px}.controller{border:1px solid #2a2e37;border-radius:12px;background:#171a21;padding:24px}.controller.live{border-color:#3fb765}.gpheading{display:flex;align-items:center;justify-content:space-between;gap:18px}.eyebrow{font-size:11px;letter-spacing:1.8px;color:#9aa0aa;font-weight:600}h1{font-size:30px;margin:6px 0 10px;font-weight:650;letter-spacing:-.7px}.muted,.gpnote{color:#aeb4bf;font-size:13px;line-height:1.6}.statepill{padding:8px 12px;border:1px solid #626977;border-radius:6px;color:#c3c9d3;font-size:13px;white-space:nowrap}.statepill.enabled{color:#84dea7;border-color:#3fb765}.gpbar{display:flex;align-items:center;gap:18px;margin:22px 0 26px}.primary{background:#2d6cdf;color:white;font-weight:650;min-width:200px}.controllergrid{display:grid;grid-template-columns:1.4fr 1fr;gap:36px}.controlmap{display:grid;grid-template-columns:1fr 1fr;gap:22px;background:#101319;border:1px solid #2a2e37;padding:22px;border-radius:8px}.stickunit{display:flex;align-items:center;flex-direction:column;gap:6px;min-width:0}.stick{position:relative;border:1px solid #626977;background:#171a21;width:110px;height:110px;border-radius:50%;display:grid;place-items:center;margin:3px 0 10px}.stick span{color:#626977;font-size:28px}.stick i{position:absolute;left:calc(50% - 9px);top:calc(50% - 9px);height:18px;width:18px;background:#93b5ff;border-radius:50%;z-index:1}.stickunit output,.triggers output{font-size:12px;color:#aeb4bf;font-variant-numeric:tabular-nums}.triggers{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr;gap:8px 18px}.triggers label{margin:0}.triggers output{grid-column:1/-1;text-align:center}meter{display:block;width:100%;height:14px;margin-top:5px;accent-color:#2d6cdf}.quickcontrols{padding:4px 0}.quickcontrols label{font-size:14px;color:#e6e6e6}.quickcontrols input[type=range]{margin:10px 0 0}.quickcontrols label output{float:right;font-variant-numeric:tabular-nums}.quickcontrols .toggle button{font-size:18px;font-weight:650}.quickcontrols p{margin:8px 0 20px}kbd{font-family:inherit;border:1px solid #626977;border-radius:5px;padding:2px 7px;font-size:12px;font-weight:650;color:#e6e6e6}.buttonlegend{display:grid;grid-template-columns:1fr 1fr;gap:12px;font-size:13px}.buttonlegend>span{line-height:1.8;padding:5px 0}.buttonlegend .pressed{color:#93b5ff}.gpnote{border-top:1px solid #2a2e37;padding-top:18px;margin:24px 0 18px}details{border-top:1px solid #2a2e37;margin-top:16px;padding-top:16px}summary{cursor:pointer;min-height:44px;line-height:1.6;color:#e6e6e6;font-size:14px}.tunegrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.tunegrid input[type=number]{display:block;width:100%;margin-top:5px}.tunegrid select{margin-top:5px}.mappingrow{display:flex;align-items:center;gap:12px;margin:14px 0;flex-wrap:wrap}.mappingrow label{flex:1}.mappingrow input[type=number]{display:block;width:100%}.actionrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0;font-size:13px}.manual{margin-top:24px}.manual fieldset{border:0;padding:0;margin:0;min-width:0}.manual .card{min-width:270px}.manual .wrap{padding:14px 0}.manual #settings{padding:14px 0}.status{max-width:1140px;margin:auto;padding:0 20px 24px;min-height:40px}#gpdevice{max-width:620px;overflow-wrap:anywhere}#gplink{font-variant-numeric:tabular-nums}#resetresponse{margin-top:18px}.manualintro{color:#aeb4bf;font-size:13px;line-height:1.7}
+ @media(max-width:720px){header{padding:10px 14px}.page{padding:16px 12px 30px}.controller{padding:18px 14px}.gpheading{align-items:flex-start;flex-direction:column;gap:12px}h1{font-size:26px}.controllergrid{grid-template-columns:1fr;gap:24px}.gpbar{align-items:flex-start;flex-direction:column;gap:10px}.primary{width:100%}.controlmap{padding:16px;gap:18px}.tunegrid{grid-template-columns:1fr 1fr}.statepill{font-size:12px}.actionrow{align-items:flex-start;flex-wrap:wrap}.manual .card{min-width:0;flex-basis:100%}.stick{width:100px;height:100px}.stickunit .muted{font-size:12px}.topstop{min-width:110px}.status{padding:0 12px 20px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
 </style></head><body>
-<header><b>PNP Driver Tuner</b><div><button onclick="toggleGp()">🎮 Gamepad</button> <button onclick="toggleSettings()">⚙ Settings</button></div></header>
-<div id="settings"></div>
-<div id="gppanel" style="display:none;padding:14px"></div>
-<div style="padding:8px 18px;color:#9aa0aa;font-size:13px;line-height:1.5">
- Set values, switch a <b>Driver ON</b>, then <b>Spin ∞</b> (continuous) or <b>Run turns</b> (move a set number of turns). <b>Stop</b> halts instantly.<br>
- <b>⚙ Settings</b>: activate axes & set slider limits · <b>🎮 Gamepad</b>: drive it with an Xbox controller.
-</div>
-<div style="padding:4px 18px 10px"><button id="estop" class="estop">■ STOP ALL</button></div>
-<div class="wrap" id="vacwrap"></div>
-<div class="wrap" id="wrap"></div>
-<div class="status" id="status">loading…</div>
+<header><b>PNP · Controller</b><button id="estop" class="topstop">■ STOP <small> / B</small></button></header>
+<main class="page"><div id="gppanel"></div>
+<details class="manual" id="manualpanel"><summary>Manual motor controls & machine settings</summary>
+<fieldset id="manualcontrols"><p class="manualintro">Disable the controller before manual moves. Set motor values, enable its driver, then choose Run turns or Spin. Turn counts use the configured steps per revolution.</p>
+<button onclick="toggleSettings()">Machine settings</button><div id="settings"></div>
+<div class="wrap" id="vacwrap"></div><div class="wrap" id="wrap"></div></fieldset></details></main>
+<div class="status" id="status" role="status" aria-live="polite">Connecting to machine…</div>
 <script>
 const MS=[1,2,4,8,16,32,64,128,256];
 const MOTOR={C0:'Nema 8 · 0.6A',C1:'Nema 8 · 0.6A',X:'Nema 17 · 2.1A',Y0:'Nema 17 · 2.1A',Y1:'Nema 17 · 2.1A',Z:'Nema 17 · 2.1A'};
 const status=document.getElementById('status');
 let S={}, AX=[], VAC={l:0,r:0}, YLINK=0;
-function api(u){return fetch(u).then(r=>r.text()).then(t=>{status.textContent=t;});}
+function api(u){return http(u).then(t=>{status.textContent=t;return t;}).catch(e=>{status.textContent=e.message;});}
 function act(on,off){on.classList.add('on');off.classList.remove('on');}
 
 function renderVac(){
@@ -327,7 +559,7 @@ function bind(i,p,f,v){const b0=gid(p+i+'0'),b1=gid(p+i+'1');
  b1.onclick=()=>{api(`/set?axis=${i}&field=${f}&value=1`);act(b1,b0);};}
 function gid(x){return document.getElementById(x);}
 function deb(el,fn){clearTimeout(el._t);el._t=setTimeout(fn,120);}
-function toggleSettings(){const e=gid('settings');e.style.display=e.style.display=='none'||!e.style.display?'block':'none';}
+function toggleSettings(){gid('manualpanel').open=true;const e=gid('settings');e.style.display=e.style.display=='none'||!e.style.display?'block':'none';}
 function saveSettings(){
  const q=new URLSearchParams();
  ['cur','spd','acc','turn'].forEach(k=>{q.set(k+'Min',gid(k+'Min').value);q.set(k+'Max',gid(k+'Max').value);});
@@ -335,97 +567,98 @@ function saveSettings(){
  AX.forEach(a=>q.set('ax'+a.n,gid('ax'+a.n).checked?1:0));
  api('/settings?'+q.toString()).then(()=>load());
 }
-function load(){fetch('/state').then(r=>r.json()).then(d=>{S=d.set;AX=d.ax;VAC=d.vac;YLINK=d.ylink;render();});}
-load();
+async function load(){try{const d=JSON.parse(await http('/state'));S=d.set;AX=d.ax;VAC=d.vac;YLINK=d.ylink;render();renderGp();}catch(e){status.textContent=e.message;}}
 
 // ---------- Xbox / Gamepad control ----------
-let GP=null, learn=null;
-let gpMap=JSON.parse(localStorage.getItem('pnpGpMap')||'{}'); gpMap.ax=gpMap.ax||{}; gpMap.btn=gpMap.btn||{};
-let macros=JSON.parse(localStorage.getItem('pnpMacros')||'{}');
-const ACTIONS=[['stopAll','STOP ALL'],['vacL','Vacuum L toggle'],['vacR','Vacuum R toggle'],['m1go','Go Macro 1'],['m2go','Go Macro 2'],['m3go','Go Macro 3'],['zero','Zero all']];
-const SCH_DEF={xy:{fast:3000,slow:200,dz:0.18,micro:16,accel:20000,invX:false,invY:true},z:{fast:1500,slow:150,dz:0.12,micro:16,accel:15000,invert:false},c:{fast:2000,slow:150,dz:0.18,micro:16,accel:15000,invert:false}};
-let scheme=JSON.parse(localStorage.getItem('pnpScheme')||'{}');
-scheme.xy=Object.assign({},SCH_DEF.xy,scheme.xy);scheme.z=Object.assign({},SCH_DEF.z,scheme.z);scheme.c=Object.assign({},SCH_DEF.c,scheme.c);
-let flight=localStorage.getItem('pnpFlight')==='1', cActive='C1', prevA=false, prevLB=false, prevRB=false, paused=false;
+function stored(key,fallback){try{return JSON.parse(localStorage.getItem(key))||fallback;}catch{return fallback;}}
+const SCH_DEF={xy:{fast:3000,slow:120,dz:0.16,micro:1,accel:30000,invX:false,invY:true},z:{fast:1500,slow:100,dz:0.10,micro:1,accel:20000,invert:false},c:{fast:2000,slow:100,dz:0.16,micro:1,accel:20000,invert:false}};
+let scheme=stored('pnpScheme',{});
+for(const k of ['xy','z','c']){scheme[k]=Object.assign({},SCH_DEF[k],scheme[k]);scheme[k].micro=1;}
+let gpMap=stored('pnpGpMap',{});gpMap.ax=gpMap.ax||{};gpMap.btn=Object.assign({stopAll:'b1',vacL:'b4',vacR:'b5'},gpMap.btn||{});
+let macros=stored('pnpMacros',{}),GP=null,learn=null,cActive='C1',armed=false,arming=false,epoch=0;
+let mode=localStorage.getItem('pnpControlMode')||'standard',sensitivity=Math.max(10,Math.min(100,+(localStorage.getItem('pnpSensitivity')||100)));
+let socket=null,sequence=0,pendingSequence=0,pendingAt=0;
+let prevB=[],pendingFrame=false,lastSent=-Infinity,lastKey='',lastAck=0,rtt=0,lastPaint=0,armGeneration=0;
+const ACTIONS=[['stopAll','STOP ALL'],['vacL','Vacuum left'],['vacR','Vacuum right'],['m1go','Recall position 1'],['m2go','Recall position 2'],['m3go','Recall position 3'],['zero','Zero positions']];
+const ZERO=()=>({x:0,y:0,z:0,c0:0,c1:0,precision:0});
+const esc=v=>String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function saveSch(){localStorage.setItem('pnpScheme',JSON.stringify(scheme));}
-function grp(g,label,extra){const o=scheme[g];return `<h3>${label}</h3><div class="row">fast <input type="number" class="sc" data-g="${g}" data-k="fast" value="${o.fast}" style="width:80px"> Hz &nbsp; slow <input type="number" class="sc" data-g="${g}" data-k="slow" value="${o.slow}" style="width:70px"> Hz &nbsp; deadzone <input type="number" step="0.05" class="sc" data-g="${g}" data-k="dz" value="${o.dz}" style="width:60px"> &nbsp; µsteps <select class="sc" data-g="${g}" data-k="micro">${MS.map(x=>`<option ${o.micro==x?'selected':''}>${x}</option>`).join('')}</select> &nbsp; accel <input type="number" class="sc" data-g="${g}" data-k="accel" value="${o.accel}" style="width:90px"> st/s² &nbsp; ${extra}</div>`;}
-function schemeHtml(){return grp('xy','Left stick → X (horizontal) / Y0+Y1 (vertical)',`<label><input type="checkbox" class="sc" data-g="xy" data-k="invX" ${scheme.xy.invX?'checked':''}>invX</label> <label><input type="checkbox" class="sc" data-g="xy" data-k="invY" ${scheme.xy.invY?'checked':''}>invY</label>`)+grp('z','Triggers → Z  (RT = up, LT = down)',`<label><input type="checkbox" class="sc" data-g="z" data-k="invert" ${scheme.z.invert?'checked':''}>invert</label>`)+grp('c','Right stick → C0 / C1  (A switches)',`<label><input type="checkbox" class="sc" data-g="c" data-k="invert" ${scheme.c.invert?'checked':''}>invert</label>`);}
-function applyScheme(){const push=(ns,g)=>ns.forEach(n=>{api(`/set?axis=${n}&field=micro&value=${scheme[g].micro}`);api(`/set?axis=${n}&field=accel&value=${scheme[g].accel}`);});push(['X','Y0','Y1'],'xy');push(['Z'],'z');push(['C0','C1'],'c');}
-function qhz(v,cfg){const a=Math.abs(v);if(a<cfg.dz)return 0;const t=(a-cfg.dz)/(1-cfg.dz);return Math.max(cfg.slow,Math.round((cfg.slow+t*(cfg.fast-cfg.slow))/50)*50);}
-function fjog(name,v,cfg,inv){let vv=inv?-v:v;const hz=qhz(vv,cfg);const dir=hz===0?0:(vv>0?1:-1);const key=dir+':'+hz;if(lastJog[name]!==key){jog(name,dir,hz);lastJog[name]=key;}}
-function fjogPair(ns,v,cfg,inv){let vv=inv?-v:v;const hz=qhz(vv,cfg);const dir=hz===0?0:(vv>0?1:-1);const key=dir+':'+hz;if(lastJog['Yp']!==key){ns.forEach(n=>jog(n,dir,hz));lastJog['Yp']=key;}}
-function flightPoll(gp){const c0=Math.abs(gp.axes[0]||0),c1=Math.abs(gp.axes[1]||0),c2=Math.abs(gp.axes[2]||0),trg=(gp.buttons[6]?gp.buttons[6].value:0)+(gp.buttons[7]?gp.buttons[7].value:0);if(paused){if(c0<0.25&&c1<0.25&&c2<0.25&&trg<0.15)paused=false;else return;}fjog('X',gp.axes[0]||0,scheme.xy,scheme.xy.invX);fjogPair(['Y0','Y1'],gp.axes[1]||0,scheme.xy,scheme.xy.invY);const rt=gp.buttons[7]?gp.buttons[7].value:0,lt=gp.buttons[6]?gp.buttons[6].value:0;fjog('Z',rt-lt,scheme.z,scheme.z.invert);fjog(cActive,gp.axes[2]||0,scheme.c,scheme.c.invert);const aNow=gp.buttons[0]&&(gp.buttons[0].pressed||gp.buttons[0].value>0.5);if(aNow&&!prevA){const old=cActive;cActive=(cActive==='C1')?'C0':'C1';jog(old,0,0);lastJog[old]='x';const ce=gid('cact');if(ce)ce.textContent=cActive;status.textContent='C stick → '+cActive;}prevA=aNow;const lb=gp.buttons[4]&&gp.buttons[4].pressed;if(lb&&!prevLB)doAction('vacL');prevLB=lb;const rb=gp.buttons[5]&&gp.buttons[5].pressed;if(rb&&!prevRB)doAction('vacR');prevRB=rb;}
 function saveGp(){localStorage.setItem('pnpGpMap',JSON.stringify(gpMap));}
 function saveMac(){localStorage.setItem('pnpMacros',JSON.stringify(macros));}
-function toggleGp(){const e=gid('gppanel');e.style.display=(e.style.display=='none'||!e.style.display)?'block':'none';if(e.style.display=='block')renderGp();}
-addEventListener('gamepadconnected',e=>{GP=e.gamepad.index;renderGp();});
-addEventListener('gamepaddisconnected',()=>{GP=null;renderGp();});
-
-function renderGp(){
- const el=gid('gppanel'); if(!el) return;
- const pads=navigator.getGamepads?navigator.getGamepads():[];
- const gp=GP!=null?pads[GP]:null;
- const names=AX.filter(a=>a.active).map(a=>a.n);
- let h=`<h2 style="margin:4px 0">Xbox controller</h2>
-  <div style="color:#9aa0aa;margin-bottom:10px">${gp?('✓ '+gp.id):'Not connected — plug in / pair your controller and press any button.'}</div>`;
- if(gp){
-  h+=`<div class="row"><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="flight" ${flight?'checked':''}> <b>PNP flight mode</b> — L-stick = X/Y gantry · triggers = Z · R-stick = C0/C1 (A switches) · LB/RB = vacuums</label></div>`;
-  if(flight){
-   h+=schemeHtml();
-   h+=`<div class="row">Right stick driving: <b id="cact">${cActive}</b>  (press <b>A</b> to switch)</div>`;
-   h+=`<div style="color:#9aa0aa;font-size:12px;margin:6px 0">Activate X, Y0, Y1, Z, C0, C1 in ⚙ Settings. Turning flight ON enables their drivers.</div>`;
-  } else {
-   h+=`<h3>Analog jog — sticks & triggers</h3>`;
-   for(let i=0;i<gp.axes.length;i++){const m=gpMap.ax[i]||{};
-    h+=`<div class="row">Axis ${i}
-     <select class="gpd" data-i="${i}"><option value="">—none—</option>${names.map(n=>`<option ${m.dest===n?'selected':''}>${n}</option>`).join('')}</select>
-     max <input type="number" class="gps" data-i="${i}" value="${m.scale||2000}" style="width:76px"> Hz
-     dz <input type="number" step="0.05" class="gpz" data-i="${i}" value="${m.dz||0.15}" style="width:58px">
-     <label><input type="checkbox" class="gpi" data-i="${i}" ${m.inv?'checked':''}>inv</label></div>`;}
-  }
-  h+=`<h3>Buttons & triggers → actions</h3>`;
-  h+=ACTIONS.map(a=>`<div class="row">${a[1]}: <b>${gpMap.btn[a[0]]||'(unbound)'}</b>
-    <button class="gpl" data-a="${a[0]}">${learn===a[0]?'press control…':'Learn'}</button></div>`).join('');
-  h+=`<h3>Macros — saved positions</h3>`;
-  h+=[1,2,3].map(s=>`<div class="row">Macro ${s}: <span style="color:#9aa0aa">${macros[s]?Object.entries(macros[s]).map(([k,v])=>k+'='+v).join(', '):'empty'}</span>
-    <button class="gpm" data-s="${s}">Save current</button></div>`).join('');
- }
- el.innerHTML=h;
- el.querySelectorAll('.gpd').forEach(x=>x.onchange=e=>{let i=e.target.dataset.i;(gpMap.ax[i]=gpMap.ax[i]||{}).dest=e.target.value;saveGp();});
- el.querySelectorAll('.gps').forEach(x=>x.onchange=e=>{let i=e.target.dataset.i;(gpMap.ax[i]=gpMap.ax[i]||{}).scale=+e.target.value;saveGp();});
- el.querySelectorAll('.gpz').forEach(x=>x.onchange=e=>{let i=e.target.dataset.i;(gpMap.ax[i]=gpMap.ax[i]||{}).dz=+e.target.value;saveGp();});
- el.querySelectorAll('.gpi').forEach(x=>x.onchange=e=>{let i=e.target.dataset.i;(gpMap.ax[i]=gpMap.ax[i]||{}).inv=e.target.checked;saveGp();});
- el.querySelectorAll('.gpl').forEach(x=>x.onclick=e=>{learn=e.target.dataset.a;renderGp();});
- el.querySelectorAll('.gpm').forEach(x=>x.onclick=e=>saveMacro(e.target.dataset.s));
- el.querySelectorAll('.sc').forEach(x=>x.onchange=e=>{const g=e.target.dataset.g,k=e.target.dataset.k;scheme[g][k]=e.target.type==='checkbox'?e.target.checked:+e.target.value;saveSch();if(k==='micro'||k==='accel')applyScheme();});
- const fl=gid('flight'); if(fl) fl.onchange=e=>{flight=e.target.checked;localStorage.setItem('pnpFlight',flight?'1':'0');lastJog={};['X','Y0','Y1','Z','C0','C1'].forEach(n=>jog(n,0,0));if(flight){applyScheme();['X','Y0','Y1','Z','C0','C1'].forEach(n=>api(`/set?axis=${n}&field=enabled&value=1`));}renderGp();};
+function getPad(){try{const pads=navigator.getGamepads?navigator.getGamepads():[];if(GP!==null&&pads[GP]?.connected)return pads[GP];return null;}catch{return null;}}
+function discoverPad(){try{const pads=Array.from(navigator.getGamepads?navigator.getGamepads():[]);const gp=pads.find(p=>p&&p.connected);GP=gp?gp.index:null;}catch{GP=null;}}
+async function http(url,method='GET',timeout=3000){const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),timeout);try{const r=await fetch(url,{method,cache:'no-store',signal:abort.signal});const t=await r.text();if(!r.ok)throw Error(t||'Controller request failed');return t;}finally{clearTimeout(timer);}}
+function setMessage(t){status.textContent=t;}
+function setC(n){cActive=n;for(const v of ['C0','C1']){const e=gid('pick'+v);if(e){e.classList.toggle('on',v===n);e.setAttribute('aria-pressed',String(v===n));}}const e=gid('cact');if(e)e.textContent=n;}
+function paintState(message){const gp=getPad(),state=gid('gpstate'),arm=gid('gparm');if(state){state.textContent=message||(armed?'Enabled · ready to move':gp?'Connected · controller disabled':'No controller');state.classList.toggle('enabled',armed);}if(arm){arm.textContent=arming?'Preparing motors…':armed?'Disable controller':'Enable controller';arm.disabled=arming||!gp||!!learn||!socket||socket.readyState!==WebSocket.OPEN;}const panel=gid('controller');if(panel)panel.classList.toggle('live',armed);const field=gid('manualcontrols');if(field)field.disabled=armed;gid('gpadvanced')?.querySelectorAll('input,select,button').forEach(e=>{e.disabled=armed||arming||(e.classList.contains('gpr')&&!macros[e.dataset.s]);});}
+async function halt(reason='Stopped',disable=false){++armGeneration;armed=false;arming=false;pendingFrame=false;pendingSequence=0;lastKey='';paintState(reason);setMessage(reason);try{await http(disable?'/controller?action=stop':'/stopall',disable?'POST':'GET',1200);}catch{setMessage(reason+' · connection unavailable; machine timeout will stop controller motion');} }
+async function enableController(){if(!socket||socket.readyState!==WebSocket.OPEN){setMessage('Controller connection is not ready.');return;}if(armed){await halt('Controller disabled',true);await load();return;}const gp=getPad();if(!gp)return;if(Object.entries(desiredFrame(gp)).some(([k,v])=>k!=='precision'&&v!==0)){setMessage('Center both sticks and release the triggers before enabling.');return;}
+ const generation=++armGeneration;arming=true;paintState();const q=new URLSearchParams({action:'arm'});for(const [g,m,a] of [['xy','mxy','axy'],['z','mz','az'],['c','mc','ac']]){q.set(m,scheme[g].micro);q.set(a,scheme[g].accel);}
+ try{const data=JSON.parse(await http('/controller?'+q,'POST',5000));if(generation!==armGeneration||document.hidden||!getPad()){await http('/controller?action=stop','POST');return;}epoch=data.epoch;armed=true;lastSent=-Infinity;lastAck=performance.now();lastKey='';setMessage('Controller enabled. B or STOP halts motion. Hold X for precision.');paintState();sendFrame(ZERO(),performance.now());}
+ catch(e){setMessage(e.message);armed=false;}finally{if(generation===armGeneration){arming=false;paintState();}} }
+function qhz(v,cfg,precision=false){const a=Math.min(1,Math.abs(v)),dz=Math.max(.02,Math.min(.5,+cfg.dz||.16));if(a<=dz)return 0;const t=(a-dz)/(1-dz),cap=Math.min(+S.spdMax||20000,Math.max(50,+cfg.fast||1000));const slow=Math.min(cap,Math.max(1,+cfg.slow||100));// Tuning rates are kept in 1/16-step equivalent units to retain existing travel speeds.
+ const micro=precision?16:1;const hz=Math.round((slow+t*(cap-slow))*(sensitivity/100)*(precision?.25:1)*micro/16);return Math.sign(v)*Math.max(1,hz);}
+function desiredFrame(gp){const f=ZERO(),precision=!!gp.buttons[2]?.pressed;f.precision=precision?1:0;if(mode==='custom'){for(const [i,m] of Object.entries(gpMap.ax)){if(!m.dest)continue;let v=gp.axes[i]||0;if(m.inv)v=-v;const key={X:'x',Y0:'y',Y1:'y',Z:'z',C0:'c0',C1:'c1'}[m.dest];if(!key)continue;const n=qhz(v,{dz:m.dz??.15,fast:m.scale||2000,slow:100},precision);if(Math.abs(n)>Math.abs(f[key]))f[key]=n;}return f;}
+ f.x=qhz((gp.axes[0]||0)*(scheme.xy.invX?-1:1),scheme.xy,precision);f.y=qhz((gp.axes[1]||0)*(scheme.xy.invY?-1:1),scheme.xy,precision);
+ f.z=qhz(((gp.buttons[7]?.value||0)-(gp.buttons[6]?.value||0))*(scheme.z.invert?-1:1),scheme.z,precision);
+ f[cActive.toLowerCase()]=qhz((gp.axes[2]||0)*(scheme.c.invert?-1:1),scheme.c,precision);return f;}
+function connectControlSocket(){
+ socket=new WebSocket('ws://'+location.hostname+':81/');
+ socket.onopen=()=>{paintState();if(!armed)setMessage('Controller link connected. Center the sticks, then enable.');};
+ socket.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.error){pendingFrame=false;if(armed)halt(d.error);return;}if(d.seq===pendingSequence&&pendingFrame){pendingFrame=false;if(armed){rtt=performance.now()-pendingAt;lastAck=performance.now();}}}catch{if(armed)halt('Controller paused · invalid machine response');}};
+ socket.onclose=()=>{pendingFrame=false;if(armed||arming)halt('Controller paused · connection lost');paintState();setTimeout(connectControlSocket,1500);};
+ socket.onerror=()=>{if(!armed)setMessage('Controller link unavailable · reconnecting…');};
 }
-function jog(n,dir,hz){api(`/jog?axis=${n}&dir=${dir}&hz=${hz}`);}
-function saveMacro(s){fetch('/state').then(r=>r.json()).then(d=>{const m={};d.ax.forEach(a=>{if(a.active)m[a.n]=a.pos;});macros[s]=m;saveMac();renderGp();});}
-function gotoMacro(s){const m=macros[s];if(!m)return;Object.keys(m).forEach(n=>api(`/goto?axis=${n}&pos=${m[n]}`));}
-function doAction(a){
- if(a==='stopAll')api('/stopall');
- else if(a==='vacL'){VAC.l=VAC.l?0:1;api('/vac?side=left&on='+VAC.l);}
- else if(a==='vacR'){VAC.r=VAC.r?0:1;api('/vac?side=right&on='+VAC.r);}
- else if(a==='zero')api('/zero?axis=all');
- else if(a[0]==='m')gotoMacro(a[1]);
+function sendFrame(frame,now){if(!armed||pendingFrame||!socket||socket.readyState!==WebSocket.OPEN)return;const key=JSON.stringify(frame);if(now-lastSent<40||(key===lastKey&&now-lastSent<100))return;
+ pendingFrame=true;lastSent=now;lastKey=key;pendingAt=now;sequence=sequence%1000000000+1;pendingSequence=sequence;
+ try{socket.send([sequence,epoch,frame.x,frame.y,frame.z,frame.c0,frame.c1,frame.precision].join(','));}catch{pendingFrame=false;halt('Controller paused · connection lost');}
 }
-let prevB=[], lastJog={};
-function poll(){requestAnimationFrame(poll);
- const pads=navigator.getGamepads?navigator.getGamepads():[]; const gp=GP!=null?pads[GP]:null; if(!gp)return;
- if(learn){for(let i=0;i<gp.buttons.length;i++){if(gp.buttons[i].pressed||gp.buttons[i].value>0.5){gpMap.btn[learn]='b'+i;learn=null;saveGp();renderGp();return;}}}
- if(flight){flightPoll(gp);}
- else{Object.keys(gpMap.ax).forEach(i=>{const m=gpMap.ax[i];if(!m||!m.dest)return;
-  let v=gp.axes[i]||0; if(m.inv)v=-v; const dz=m.dz||0.15; const n=m.dest;
-  if(Math.abs(v)<dz){if(lastJog[n]!==0){jog(n,0,0);lastJog[n]=0;}return;}
-  const hz=Math.max(200,Math.round(Math.abs(v)*(m.scale||2000)/200)*200); const dir=v>0?1:-1; const key=dir+':'+hz;
-  if(lastJog[n]!==key){jog(n,dir,hz);lastJog[n]=key;}});}
- for(let i=0;i<gp.buttons.length;i++){const p=gp.buttons[i].pressed||gp.buttons[i].value>0.5;
-  if(p&&!prevB[i]){Object.keys(gpMap.btn).forEach(act=>{if(gpMap.btn[act]==='b'+i)doAction(act);});}
-  prevB[i]=p;}
-}
-{const es=gid('estop'); if(es) es.onclick=()=>{api('/stopall');paused=true;lastJog={};status.textContent='STOP ALL — flight paused until sticks re-center';};}
-poll();
+function tuningGroup(g,label,extra){const c=scheme[g];return `<h3>${label}</h3><div class="tunegrid"><label>Top speed (1/16-step Hz)<input type="number" class="sc" data-g="${g}" data-k="fast" min="50" max="${S.spdMax||20000}" value="${c.fast}"></label><label>Start speed (1/16-step Hz)<input type="number" class="sc" data-g="${g}" data-k="slow" min="20" value="${c.slow}"></label><label>Deadzone<input type="number" class="sc" data-g="${g}" data-k="dz" min="0.02" max="0.5" step="0.02" value="${c.dz}"></label><label>Resolution<p>Normal: 1<br>Hold X: 1/16</p></label><label>Accel (1/16-step units)<input type="number" class="sc" data-g="${g}" data-k="accel" min="100" max="${S.accMax||50000}" value="${c.accel}"></label>${extra}</div>`;}
+function renderGp(){const el=gid('gppanel');if(!el)return;const wasOpen=gid('gpadvanced')?.open, gp=getPad();
+ el.innerHTML=`<section class="controller" id="controller"><div class="gpheading"><div><div class="eyebrow">XBOX CONTROL</div><h1>Move the machine.</h1><div id="gpdevice" class="muted"></div></div><span class="statepill" id="gpstate"></span></div>
+ <div class="gpbar"><button class="primary" id="gparm">Enable controller</button><span class="muted" id="gplink">Waiting for controller</span></div>
+ <div class="controllergrid"><div class="controlmap"><div class="stickunit"><div class="stick" aria-label="Left stick input"><i id="leftdot"></i><span>+</span></div><b>Left stick</b><span class="muted">X / paired Y motors</span><output id="xyread">X 0 · Y 0 Hz</output></div><div class="stickunit"><div class="stick" aria-label="Right stick input"><i id="rightdot"></i><span>+</span></div><b>Right stick</b><span class="muted">Rotate <b id="cact">${cActive}</b></span><output id="cread">0 Hz</output></div><div class="triggers"><label>LT · Z down<meter id="ltmeter" min="0" max="1" value="0"></meter></label><label>RT · Z up<meter id="rtmeter" min="0" max="1" value="0"></meter></label><output id="zread">Z 0 Hz</output></div></div>
+ <div class="quickcontrols"><label>Right stick motor</label><div class="toggle"><button id="pickC0" aria-pressed="false">C0</button><button id="pickC1" aria-pressed="true">C1</button></div><p class="muted">Press <kbd>A</kbd> to switch.</p><label for="sensitivity">Jog speed <output id="sensitivityvalue">${sensitivity}%</output></label><input id="sensitivity" type="range" min="10" max="100" step="5" value="${sensitivity}"><p class="muted">Normal: full steps. Hold <kbd>X</kbd> for 1/16-step precision at quarter speed. <b id="stepmode">Full step · 1</b></p><div class="buttonlegend"><span id="chipB"><kbd>B</kbd> Stop</span><span id="chipLB"><kbd>LB</kbd> Left vacuum</span><span id="chipRB"><kbd>RB</kbd> Right vacuum</span><span id="chipX"><kbd>X</kbd> Precision</span></div><p class="muted" id="vacread">Vacuums · left ${VAC.l?'ON':'OFF'} · right ${VAC.r?'ON':'OFF'}</p></div></div>
+ <p class="gpnote">Enable prepares all six motors. Center the sticks first. Disconnecting the controller, leaving this page, or losing updates stops controller motion. Motor current is unchanged.</p>
+ <details id="gpadvanced" ${wasOpen?'open':''}><summary>Controller tuning & saved positions</summary><p class="muted">Disable the controller to change these settings.</p><label>Control layout<select id="controlmode"><option value="standard">Xbox preset</option><option value="custom">Custom stick mappings</option></select></label>
+ ${tuningGroup('xy','Left stick · X / Y',`<label><input class="sc" type="checkbox" data-g="xy" data-k="invX" ${scheme.xy.invX?'checked':''}> Reverse X</label><label><input class="sc" type="checkbox" data-g="xy" data-k="invY" ${scheme.xy.invY?'checked':''}> Reverse Y</label>`)}${tuningGroup('z','Triggers · Z',`<label><input class="sc" type="checkbox" data-g="z" data-k="invert" ${scheme.z.invert?'checked':''}> Reverse Z</label>`)}${tuningGroup('c','Right stick · C0 / C1',`<label><input class="sc" type="checkbox" data-g="c" data-k="invert" ${scheme.c.invert?'checked':''}> Reverse rotation</label>`)}
+ <details><summary>Custom mappings & button learning</summary><p class="muted">B always stops. In Xbox preset, A switches motors and X is precision.</p>${[0,1,2,3].map(i=>{const m=gpMap.ax[i]||{};return `<div class="mappingrow"><label>Stick axis ${i}<select class="gpd" data-i="${i}"><option value="">Unassigned</option>${['X','Y0','Y1','Z','C0','C1'].map(n=>`<option ${m.dest===n?'selected':''}>${n}</option>`).join('')}</select></label><label>Max Hz<input class="gps" data-i="${i}" type="number" min="50" value="${+m.scale||2000}"></label><label>Deadzone<input class="gpz" data-i="${i}" type="number" min="0.02" max="0.5" step="0.02" value="${+m.dz||.15}"></label><label><input class="gpi" data-i="${i}" type="checkbox" ${m.inv?'checked':''}> Reverse</label></div>`;}).join('')}${ACTIONS.map(([a,label])=>`<div class="actionrow"><span>${label} · <b>${esc(gpMap.btn[a]||'unassigned')}</b></span><button class="gpl" data-a="${a}">${learn===a?'Press a button…':'Learn'}</button></div>`).join('')}</details>
+ <h3>Saved positions</h3>${[1,2,3].map(n=>`<div class="actionrow"><span>Position ${n} · ${macros[n]?'saved':'empty'}</span><div><button class="gpm" data-s="${n}">Save current</button> <button class="gpr" data-s="${n}" ${macros[n]?'':'disabled'}>Recall</button></div></div>`).join('')}<button id="resetresponse">Restore responsive defaults</button></details></section>`;
+ gid('gpdevice').textContent=gp?gp.id:(!navigator.getGamepads?'Gamepad access unavailable in this browser.':'Connect an Xbox controller, then press any button.');
+ gid('gparm').onclick=enableController;gid('pickC0').onclick=()=>setC('C0');gid('pickC1').onclick=()=>setC('C1');setC(cActive);
+ gid('sensitivity').oninput=e=>{sensitivity=+e.target.value;gid('sensitivityvalue').textContent=sensitivity+'%';localStorage.setItem('pnpSensitivity',sensitivity);};
+ gid('controlmode').value=mode;gid('controlmode').onchange=e=>{mode=e.target.value;localStorage.setItem('pnpControlMode',mode);};
+ el.querySelectorAll('.sc').forEach(x=>x.onchange=e=>{const g=e.target.dataset.g,k=e.target.dataset.k;let v=e.target.type==='checkbox'?e.target.checked:+e.target.value;if(k==='dz')v=Math.max(.02,Math.min(.5,v));if(k==='accel')v=Math.max(100,Math.min(S.accMax||50000,v));if(k==='fast'||k==='slow')v=Math.max(20,Math.min(S.spdMax||20000,v));scheme[g][k]=v;saveSch();});
+ for(const [selector,key,convert] of [['.gpd','dest',v=>v],['.gps','scale',Number],['.gpz','dz',Number],['.gpi','inv',Boolean]])el.querySelectorAll(selector).forEach(x=>x.onchange=e=>{const i=e.target.dataset.i;gpMap.ax[i]=gpMap.ax[i]||{};gpMap.ax[i][key]=convert(e.target.type==='checkbox'?e.target.checked:e.target.value);saveGp();});
+ el.querySelectorAll('.gpl').forEach(x=>x.onclick=()=>{learn=learn===x.dataset.a?null:x.dataset.a;renderGp();});el.querySelectorAll('.gpm').forEach(x=>x.onclick=()=>saveMacro(x.dataset.s));el.querySelectorAll('.gpr').forEach(x=>x.onclick=()=>gotoMacro(x.dataset.s));
+ gid('resetresponse').onclick=()=>{scheme=JSON.parse(JSON.stringify(SCH_DEF));saveSch();renderGp();};paintState();}
+function toggleGp(){gid('gppanel').scrollIntoView({behavior:'smooth'});}
+async function saveMacro(n){try{const d=JSON.parse(await http('/state'));const m={};for(const a of d.ax)if(a.active)m[a.n]=Math.round(a.pos*16/a.mic);macros[n]=m;saveMac();renderGp();setMessage('Saved position '+n);}catch(e){setMessage(e.message);}}
+async function gotoMacro(n){const m=macros[n];if(!m)return;await halt('Moving to saved position '+n);const d=JSON.parse(await http('/state'));const micros=Object.fromEntries(d.ax.map(a=>[a.n,a.mic]));for(const [axis,pos] of Object.entries(m)){if(YLINK&&axis==='Y1')continue;await api(`/goto?axis=${axis}&pos=${Math.round(pos*(micros[axis]||1)/16)}`);} }
+async function doAction(a){if(a==='stopAll')return halt('Stopped · enable controller to resume');if(a==='vacL'||a==='vacR'){if(!armed)return;const side=a==='vacL'?'l':'r',next=VAC[side]?0:1;try{await http('/vac?side='+(side==='l'?'left':'right')+'&on='+next);VAC[side]=next;gid('vacread').textContent=`Vacuums · left ${VAC.l?'ON':'OFF'} · right ${VAC.r?'ON':'OFF'}`;}catch(e){setMessage(e.message);} }else if(a==='zero'){await halt('Controller stopped');await api('/zero?axis=all');}else if(a[0]==='m')await gotoMacro(a[1]);}
+function paintInputs(gp,f,now){if(now-lastPaint<33)return;lastPaint=now;const lx=gp?.axes[0]||0,ly=gp?.axes[1]||0,rx=gp?.axes[2]||0,ry=gp?.axes[3]||0;
+ gid('stepmode').textContent=f.precision?'Precision · 1/16':'Full step · 1';
+ gid('leftdot').style.transform=`translate(${lx*32}px,${ly*32}px)`;gid('rightdot').style.transform=`translate(${rx*32}px,${ry*32}px)`;
+ gid('ltmeter').value=gp?.buttons[6]?.value||0;gid('rtmeter').value=gp?.buttons[7]?.value||0;gid('xyread').textContent=`X ${f.x} · Y ${f.y} Hz`;gid('cread').textContent=`${f[cActive.toLowerCase()]} Hz`;gid('zread').textContent=`Z ${f.z} Hz`;
+ for(const [id,i] of [['chipB',1],['chipLB',4],['chipRB',5],['chipX',2]])gid(id)?.classList.toggle('pressed',!!gp?.buttons[i]?.pressed);
+ gid('gplink').textContent=armed?(rtt?`${Math.round(rtt)} ms · live`:'Connecting…'):gp?'Inputs visible · motion disabled':'Waiting for controller';}
+function poll(now){requestAnimationFrame(poll);let gp=getPad();if(!gp&&GP!==null){GP=null;if(armed||arming)halt('Controller disconnected');renderGp();}if(!gp&&GP===null){discoverPad();gp=getPad();if(gp)renderGp();}if(!gid('leftdot'))return;
+ const f=gp?desiredFrame(gp):ZERO();paintInputs(gp,f,now);if(!gp)return;
+ const b=gp.buttons.map(v=>v.pressed||v.value>.5);
+ if(learn){const i=b.findIndex((v,i)=>v&&!prevB[i]);if(i>=0){gpMap.btn[learn]='b'+i;learn=null;saveGp();renderGp();}prevB=b;return;}
+ if(b[1]&&!prevB[1]){halt('Stopped · enable controller to resume');prevB=b;return;}
+ if(mode==='standard'&&b[0]&&!prevB[0])setC(cActive==='C1'?'C0':'C1');
+ if(armed){for(let i=0;i<b.length;i++)if(i!==1&&b[i]&&!prevB[i])for(const [a,v] of Object.entries(gpMap.btn))if(v==='b'+i)doAction(a);
+  if(pendingFrame&&now-pendingAt>550){halt('Controller paused · connection stalled');}else sendFrame(desiredFrame(gp),now);}
+ prevB=b;}
+addEventListener('gamepadconnected',e=>{if(!armed){GP=e.gamepad.index;renderGp();}});
+addEventListener('gamepaddisconnected',e=>{if(e.gamepad.index===GP){GP=null;halt('Controller disconnected');renderGp();}});
+addEventListener('blur',()=>{if(armed||arming)halt('Controller paused · page lost focus');});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&(armed||arming))halt('Controller paused · page hidden');});
+addEventListener('pagehide',()=>{if(armed||arming){armed=false;fetch('/stopall',{keepalive:true}).catch(()=>{});}});
+addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();halt('Stopped · enable controller to resume');}});
+gid('estop').onclick=()=>halt('Stopped · enable controller to resume');
+discoverPad();renderGp();load();connectControlSocket();requestAnimationFrame(poll);
 </script></body></html>
 )rawhtml";
 
@@ -437,7 +670,7 @@ static int axisIndex(const String& n) {
 static void handleRoot() { server.send_P(200, "text/html", PAGE); }
 
 static void handleState() {
-  String j = "{\"set\":{";
+  String j = "{\"firmware\":\"pnp-precision-1\",\"controller\":" + String(controllerArmed ? 1 : 0) + ",\"set\":{";
   j += "\"curMin\":" + String(cfg.curMin) + ",\"curMax\":" + String(cfg.curMax);
   j += ",\"spdMin\":" + String(cfg.spdMin) + ",\"spdMax\":" + String(cfg.spdMax);
   j += ",\"accMin\":" + String(cfg.accMin) + ",\"accMax\":" + String(cfg.accMax);
@@ -451,7 +684,15 @@ static void handleState() {
          ",\"mic\":" + a.microsteps + ",\"spread\":" + (a.spread ? 1 : 0) +
          ",\"dir\":" + (a.dir ? 1 : 0) + ",\"en\":" + (a.driverOn ? 1 : 0) +
          ",\"conn\":" + a.conn + ",\"fs\":" + (a.fs ? 1 : 0) +
-         ",\"pos\":" + String((long)(a.fs ? a.fs->getCurrentPosition() : 0)) + "}";
+         ",\"running\":" + (a.fs && a.fs->isRunning() ? 1 : 0) +
+         ",\"continuous\":" + (a.fs && a.fs->isRunningContinuously() ? 1 : 0) +
+         ",\"target\":" + String((long)(a.fs ? a.fs->targetPos() : 0)) +
+         ",\"pos\":" + String((long)(a.fs ? a.fs->getCurrentPosition() : 0));
+    if (server.hasArg("drivers")) {
+      const uint8_t mres = a.drv->mres();
+      j += ",\"hardwareMicro\":" + String(mres <= 8 ? (1U << (8 - mres)) : 0);
+    }
+    j += "}";
   }
   j += "],\"vac\":{\"l\":" + String(vacLeft ? 1 : 0) + ",\"r\":" + String(vacRight ? 1 : 0) +
        "},\"ylink\":" + String(yLinked ? 1 : 0) + "}";
@@ -477,17 +718,18 @@ static int ySibling(int i) {
 
 static bool applyField(Axis& a, const String& f, long v) {
   if      (f == "current") { a.current_mA = constrain(v, 0L, (long)a.maxCurrent); a.drv->rms_current(a.current_mA); }
-  else if (f == "micro")   { a.microsteps = v; a.drv->microsteps(a.microsteps); }
+  else if (f == "micro")   { if (!validMicrosteps(v) || (a.fs && a.fs->isRunning())) return false; a.microsteps = v; a.drv->microsteps(a.microsteps == 1 ? 0 : a.microsteps); }
   else if (f == "spread")  { a.spread = v; a.drv->en_spreadCycle(a.spread); }
   else if (f == "accel")   { a.accel = constrain(v, 1L, (long)cfg.accMax); if (a.fs) a.fs->setAcceleration(a.accel); }
   else if (f == "dir")     { a.dir = v; adjustIfSpinning(a); }         // never auto-starts
   else if (f == "speed")   { a.speed_hz = constrain(v, 0L, (long)cfg.spdMax); adjustIfSpinning(a); }
-  else if (f == "enabled") { a.driverOn = v; applyDriver(a); if (!a.driverOn && a.fs) { a.fs->forceStop(); a.spinning = false; } }
+  else if (f == "enabled") { a.driverOn = v; applyDriver(a); if (!a.driverOn) stopAxis(a); }
   else return false;
   return true;
 }
 
 static void handleSet() {
+  if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
   int i = axisIndex(server.arg("axis"));
   if (i < 0) { server.send(400, "text/plain", "bad axis"); return; }
   String f = server.arg("field");
@@ -499,41 +741,58 @@ static void handleSet() {
 }
 
 static void handleRun() {
+  if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
   int i = axisIndex(server.arg("axis"));
   if (i < 0) { server.send(400, "text/plain", "bad axis"); return; }
   Axis& a = axes[i];
   if (!a.fs) { server.send(409, "text/plain", String(a.name) + ": no step channel"); return; }
   if (!a.driverOn) { server.send(409, "text/plain", String(a.name) + ": driver OFF"); return; }
-  int s = ySibling(i);                                 // sibling self-guards (fs/driverOn)
+  int s = ySibling(i);
+  if (s >= 0 && (!axes[s].active || !axes[s].fs || !axes[s].driverOn)) {
+    server.send(409, "text/plain", "Both linked Y axes must be active, connected and ON"); return;
+  }
+  const bool spin = server.arg("mode") == "spin";
+  const String value = server.arg("turns");
+  char* end = nullptr;
+  const float turns = strtof(value.c_str(), &end);
+  const double steps = (double)turns * cfg.stepsPerRev * a.microsteps;
+  if (!spin && (value.isEmpty() || end == value.c_str() || *end != '\0' ||
+                !isfinite(turns) || turns <= 0 || turns > cfg.turnMax ||
+                steps < 0.5 || steps > INT32_MAX)) {
+    server.send(400, "text/plain", "Turns must be a positive number within the configured limit"); return;
+  }
   if (s >= 0) {   // linked: make the sibling match this axis so the pair moves identically
     Axis& b = axes[s];
     b.speed_hz = a.speed_hz; b.accel = a.accel; b.dir = a.dir;
-    if (b.microsteps != a.microsteps) { b.microsteps = a.microsteps; b.drv->microsteps(a.microsteps); }
+    if (b.microsteps != a.microsteps) { b.microsteps = a.microsteps; b.drv->microsteps(a.microsteps == 1 ? 0 : a.microsteps); }
   }
   String label = String(a.name) + (s >= 0 ? "+" + String(axes[s].name) : "");
-  if (server.arg("mode") == "spin") {
-    spinContinuous(a);
-    if (s >= 0) spinContinuous(axes[s]);
-    server.send(200, "text/plain", label + " spinning @ " + a.speed_hz + " Hz");
-  } else {
-    float turns = server.arg("turns").toFloat();
-    runTurns(a, turns);
-    if (s >= 0) runTurns(axes[s], turns);
-    server.send(200, "text/plain", label + " running " + String(turns, 2) + " turns");
+  int8_t result = spin ? spinContinuous(a) : runTurns(a, turns);
+  if (result == MOVE_OK && s >= 0)
+    result = spin ? spinContinuous(axes[s]) : runTurns(axes[s], turns);
+  if (result != MOVE_OK) {
+    stopAxis(a); if (s >= 0) stopAxis(axes[s]);
+    server.send(409, "text/plain", label + " move rejected: " + String(result)); return;
   }
+  if (spin) server.send(200, "text/plain", label + " spinning @ " + a.speed_hz + " Hz");
+  else server.send(200, "text/plain", label + " running " + String(turns, 2) +
+                   " turns (" + String(abs(turnsToSteps(turns, a))) + " pulses @ " +
+                   String(turnSpeed(a)) + " Hz)");
 }
 
 static void handleStop() {
+  if (controllerArmed) { releaseController(); server.send(200, "text/plain", "Controller stopped"); return; }
   int i = axisIndex(server.arg("axis"));
   if (i < 0) { server.send(400, "text/plain", "bad axis"); return; }
-  if (axes[i].fs) axes[i].fs->forceStop();   // immediate, no deceleration
-  axes[i].spinning = false;
+  stopAxis(axes[i]);
   int s = ySibling(i);
-  if (s >= 0) { if (axes[s].fs) axes[s].fs->forceStop(); axes[s].spinning = false; }
+  if (s >= 0) stopAxis(axes[s]);
   server.send(200, "text/plain", String(axes[i].name) + " stop");
 }
 
 static void handlePair() {
+  if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
+  stopAxis(axes[axisIndex("Y0")]); stopAxis(axes[axisIndex("Y1")]);
   yLinked = server.arg("on").toInt() != 0;
   saveSettings();
   server.send(200, "text/plain", yLinked ? "Y0 + Y1 linked" : "Y0 / Y1 independent");
@@ -542,6 +801,7 @@ static void handlePair() {
 // Continuous jog while a control is held (dir 1/-1 run, 0 stop). Uses its own
 // speed (hz) so it does NOT clobber the slider's speed_hz.
 static void handleJog() {
+  if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
   int i = axisIndex(server.arg("axis"));
   if (i < 0) { server.send(400, "text/plain", "bad axis"); return; }
   int dir = server.arg("dir").toInt();
@@ -560,6 +820,7 @@ static void handleJog() {
 
 // Absolute move (for macro recall).
 static void handleGoto() {
+  if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
   int i = axisIndex(server.arg("axis"));
   if (i < 0) { server.send(400, "text/plain", "bad axis"); return; }
   long pos = server.arg("pos").toInt();
@@ -577,6 +838,7 @@ static void handleGoto() {
 }
 
 static void handleZero() {
+  if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
   String ax = server.arg("axis");
   for (int i = 0; i < NAX; i++)
     if ((ax == "all" || ax == axes[i].name) && axes[i].fs) axes[i].fs->setCurrentPosition(0);
@@ -584,11 +846,12 @@ static void handleZero() {
 }
 
 static void handleStopAll() {
-  for (int i = 0; i < NAX; i++) { if (axes[i].fs) axes[i].fs->forceStop(); axes[i].spinning = false; }
+  releaseController();
   server.send(200, "text/plain", "ALL STOP");
 }
 
 static void handleSettings() {
+  if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
   auto getU = [](const char* k, uint32_t def) {
     return server.hasArg(k) ? (uint32_t)server.arg(k).toInt() : def;
   };
@@ -606,10 +869,72 @@ static void handleSettings() {
       axes[i].conn = axes[i].drv->test_connection();
       applyDriver(axes[i]);
     }
-    if (!axes[i].active && was && axes[i].fs) axes[i].fs->forceStop();
+    if (!axes[i].active && was) { axes[i].driverOn = false; axes[i].drv->toff(0); stopAxis(axes[i]); }
   }
   saveSettings();
   server.send(200, "text/plain", "settings saved");
+}
+
+// Generate small test moves with all motor outputs physically disabled by EN.
+// Leave every software driver OFF afterwards; this is an explicit diagnostic API.
+static volatile uint32_t testPulses[NAX] = {};
+static void IRAM_ATTR countTestPulse(void* arg) { ++*static_cast<volatile uint32_t*>(arg); }
+static void handleMotionTest() {
+  releaseController();
+  const bool fastTest = server.arg("fast") == "1";
+  const int32_t testSteps = fastTest ? 3200 : 320;
+  digitalWrite(PIN_EN, HIGH);
+  int32_t originalPositions[NAX] = {};
+  for (int i = 0; i < NAX; ++i)
+    if (axes[i].fs) originalPositions[i] = axes[i].fs->getCurrentPosition();
+  for (auto& a : axes) {
+    if (a.fs) a.fs->forceStopAndNewPosition(a.fs->getCurrentPosition());
+    a.driverOn = false; a.spinning = false; a.drv->toff(0);
+  }
+  for (int i = 0; i < NAX; ++i) {
+    testPulses[i] = 0;
+    attachInterruptArg(axes[i].stepPin, countTestPulse, (void*)&testPulses[i], RISING);
+  }
+  String j = "[";
+  for (int test = 0; test < NAX + 1; ++test) {
+    int first = test < NAX ? test : axisIndex("Y0");
+    int second = test < NAX ? -1 : axisIndex("Y1");
+    int ids[2] = {first, second};
+    int32_t start[2] = {0, 0};
+    for (int k = 0; k < 2; ++k) {
+      if (ids[k] < 0 || !axes[ids[k]].fs) continue;
+      auto* fs = axes[ids[k]].fs;
+      start[k] = fs->getCurrentPosition();
+      testPulses[ids[k]] = 0;
+      fs->setAcceleration(fastTest ? 30000 : 2000); fs->setSpeedInHz(fastTest ? 4000 : 400); fs->move(testSteps);
+    }
+    uint32_t began = millis();
+    delay(20);
+    while (millis() - began < 2000) {
+      bool running = false;
+      for (int k = 0; k < 2; ++k)
+        if (ids[k] >= 0 && axes[ids[k]].fs) running |= axes[ids[k]].fs->isRunning();
+      if (!running) break;
+      delay(1);
+    }
+    for (int k = 0; k < 2; ++k) {
+      if (ids[k] < 0) continue;
+      auto& a = axes[ids[k]];
+      if (j.length() > 1) j += ",";
+      j += "{\"axis\":\"" + String(a.name) + "\",\"paired\":" + String(test == NAX ? 1 : 0);
+      j += ",\"running\":" + String(a.fs && a.fs->isRunning() ? 1 : 0);
+      j += ",\"pulses\":" + String(testPulses[ids[k]]);
+      j += ",\"delta\":" + String((long)(a.fs ? a.fs->getCurrentPosition() - start[k] : 0)) + "}";
+      if (a.fs) a.fs->forceStopAndNewPosition(a.fs->getCurrentPosition());
+    }
+  }
+  for (int i = 0; i < NAX; ++i) {
+    detachInterrupt(axes[i].stepPin);
+    if (axes[i].fs) axes[i].fs->setCurrentPosition(originalPositions[i]);
+  }
+  // Safe to release EN only once every pulse queue has been cleared and toff=0.
+  digitalWrite(PIN_EN, LOW);
+  server.send(200, "application/json", j + "]");
 }
 
 void setup() {
@@ -618,16 +943,17 @@ void setup() {
 
   loadSettings();
 
-  TMCSerialA.begin(UART_BAUD, SERIAL_8N1, PIN_UART_A, PIN_UART_A);
-  TMCSerialB.begin(UART_BAUD, SERIAL_8N1, PIN_UART_B, PIN_UART_B);
+  TMCSerialA.begin(UART_BAUD, SERIAL_8N1, PIN_UART_A, PIN_UART_TX_A);
+  TMCSerialB.begin(UART_BAUD, SERIAL_8N1, PIN_UART_B, PIN_UART_TX_B);
 
   pinMode(PIN_EN, OUTPUT);
-  digitalWrite(PIN_EN, LOW);                  // global enable; per-axis via toff
+  digitalWrite(PIN_EN, HIGH);                 // keep all drivers disabled during setup
 
   pinMode(PIN_VAC_LEFT, OUTPUT);  digitalWrite(PIN_VAC_LEFT, LOW);   // vacuums OFF at boot
   pinMode(PIN_VAC_RIGHT, OUTPUT); digitalWrite(PIN_VAC_RIGHT, LOW);
 
   engine.init();
+  engine.task_rate(2);
 
   for (int i = 0; i < NAX; ++i) {
     Axis& a = axes[i];
@@ -637,6 +963,8 @@ void setup() {
     a.conn = a.drv->test_connection();
     applyDriver(a);                           // boots with driverOn default + speed 0 => no motion
   }
+
+  digitalWrite(PIN_EN, LOW);                  // all configured drivers are OFF
 
   // Try to join your network; fall back to our own AP if it doesn't connect.
   WiFi.mode(WIFI_STA);
@@ -657,7 +985,7 @@ void setup() {
   ArduinoOTA.setHostname(OTA_HOSTNAME);
   ArduinoOTA.setPassword(OTA_PASS);
   ArduinoOTA.onStart([]() {                 // stop all motion before reflashing
-    for (int i = 0; i < NAX; i++) { if (axes[i].fs) axes[i].fs->forceStop(); }
+    for (auto& a : axes) stopAxis(a);
     digitalWrite(PIN_EN, HIGH);
     digitalWrite(PIN_VAC_LEFT, LOW); digitalWrite(PIN_VAC_RIGHT, LOW);
   });
@@ -665,6 +993,9 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/state", HTTP_GET, handleState);
+  server.on("/controller", HTTP_POST, handleController);
+  server.on("/control", HTTP_POST, handleControlFrame);
+  server.on("/motiontest", HTTP_POST, handleMotionTest);
   server.on("/set", HTTP_GET, handleSet);
   server.on("/run", HTTP_GET, handleRun);
   server.on("/stop", HTTP_GET, handleStop);
@@ -676,9 +1007,14 @@ void setup() {
   server.on("/zero", HTTP_GET, handleZero);
   server.on("/stopall", HTTP_GET, handleStopAll);
   server.begin();
+  controlSocket.begin();
+  controlSocket.onEvent(controlSocketEvent);
 }
 
 void loop() {
+  if (controllerArmed && millis() - controllerLastFrame > (controllerPrimed ? CONTROLLER_TIMEOUT_MS : 2000)) releaseController();
+  controlSocket.loop();
+  serviceControllerResolution();
   server.handleClient();
   ArduinoOTA.handle();
 }
