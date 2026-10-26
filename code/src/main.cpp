@@ -50,8 +50,8 @@ static constexpr float R_SENSE = 0.11f;          // **match your driver module**
 static constexpr int   PIN_EN  = 48;             // global enable, active LOW
 
 // ---- Vacuum low-side switches (active HIGH; 10k gate pulldowns keep them OFF) ----
-static constexpr int PIN_VAC_LEFT  = 7;          // Q1 gate via R5  (Vacuum Left)
-static constexpr int PIN_VAC_RIGHT = 4;          // Q3 gate via R12 (Vacuum Right)
+static constexpr int PIN_VAC_LEFT  = 4;          // Q3 / R12: installed machine left vacuum
+static constexpr int PIN_VAC_RIGHT = 7;          // Q1 / R5: installed machine right vacuum
 bool vacLeft = false, vacRight = false;
 bool yLinked = false;                            // Y0 & Y1 move together when true
 
@@ -108,6 +108,13 @@ struct Settings {
 };
 Settings cfg = {0, 1500, 0, 4000, 100, 50000, 0, 100, 200};
 
+// User-tunable Z travel in MOTOR revolutions below the top; 0 disables limits.
+// No millimetre conversion is assumed without the lead-screw/belt calibration.
+static constexpr float Z_TRAVEL_TURNS_DEFAULT = 0.0f;
+static float zTravelTurns = Z_TRAVEL_TURNS_DEFAULT;
+static bool zPositiveUp = true, zTopKnown = false;
+static constexpr int Z_AXIS = 1;
+
 Preferences prefs;
 WebServer server(80);
 WebSocketsServer controlSocket(81);
@@ -127,6 +134,9 @@ static void loadSettings() {
   for (int i = 0; i < NAX; ++i)
     axes[i].active = prefs.getBool((String("act") + axes[i].name).c_str(), axes[i].active);
   yLinked = prefs.getBool("yLink", yLinked);
+  zTravelTurns = prefs.getFloat("zTravel", Z_TRAVEL_TURNS_DEFAULT);
+  zPositiveUp = prefs.getBool("zUp", true);
+  if (!isfinite(zTravelTurns) || zTravelTurns < 0 || (double)zTravelTurns * cfg.stepsPerRev > INT32_MAX / 256) zTravelTurns = 0;
   prefs.end();
 }
 
@@ -140,6 +150,7 @@ static void saveSettings() {
   for (int i = 0; i < NAX; ++i)
     prefs.putBool((String("act") + axes[i].name).c_str(), axes[i].active);
   prefs.putBool("yLink", yLinked);
+  prefs.putFloat("zTravel", zTravelTurns); prefs.putBool("zUp", zPositiveUp);
   prefs.end();
 }
 
@@ -192,11 +203,33 @@ static int32_t turnsToSteps(float turns, const Axis& a) {
   return (int32_t)lround(turns * (float)cfg.stepsPerRev * (float)a.microsteps);
 }
 
+static bool zLimitsEnabled() { return zTravelTurns > 0 || zTopKnown; }
+static int32_t zBottomSteps() {
+  return (int32_t)floor((double)zTravelTurns * cfg.stepsPerRev * axes[Z_AXIS].microsteps);
+}
+static bool zTargetAllowed(int64_t rawTarget) {
+  if (!zLimitsEnabled()) return true;
+  if (!zTopKnown) return false;
+  const int64_t logical = zPositiveUp ? rawTarget : -rawTarget;
+  return logical <= 0 && (zTravelTurns <= 0 || logical >= -(int64_t)zBottomSteps());
+}
+static int8_t startZRate(int32_t hz) {
+  Axis& a = axes[Z_AXIS];
+  if (!hz) { a.fs->stopMove(); return MOVE_OK; }
+  if (!zLimitsEnabled()) return hz > 0 ? a.fs->runForward() : a.fs->runBackward();
+  if (!zTopKnown) { a.fs->stopMove(); return -1; }
+  // A finite target lets the pulse planner brake before the limit, even if
+  // WiFi or the main loop stalls. No polling-based emergency boundary stop.
+  const bool up = (hz > 0) == zPositiveUp;
+  if (!up && zTravelTurns <= 0) return hz > 0 ? a.fs->runForward() : a.fs->runBackward();
+  return a.fs->moveTo(up ? 0 : (zPositiveUp ? -zBottomSteps() : zBottomSteps()));
+}
+
 static int8_t spinContinuous(Axis& a) {
   if (!a.fs || !a.driverOn || a.speed_hz < 1) { if (a.fs) a.fs->stopMove(); a.spinning = false; return -1; }
   a.fs->setAcceleration(a.accel);
   a.fs->setSpeedInHz(a.speed_hz);
-  int8_t result = a.dir ? a.fs->runForward() : a.fs->runBackward();
+  int8_t result = (&a == &axes[Z_AXIS]) ? startZRate(a.dir ? a.speed_hz : -(int32_t)a.speed_hz) : (a.dir ? a.fs->runForward() : a.fs->runBackward());
   a.spinning = result == MOVE_OK;
   return result;
 }
@@ -205,7 +238,8 @@ static int8_t spinContinuous(Axis& a) {
 static void adjustIfSpinning(Axis& a) {
   if (!a.fs || !a.spinning) return;
   a.fs->setSpeedInHz(max<uint32_t>(a.speed_hz, 1));
-  if (a.dir) a.fs->runForward(); else a.fs->runBackward();
+  if (&a == &axes[Z_AXIS]) startZRate(a.dir ? a.speed_hz : -(int32_t)a.speed_hz);
+  else if (a.dir) a.fs->runForward(); else a.fs->runBackward();
 }
 
 static int8_t runTurns(Axis& a, float turns) {
@@ -218,6 +252,7 @@ static int8_t runTurns(Axis& a, float turns) {
   a.fs->setSpeedInHz(turnSpeed(a));
   int32_t steps = turnsToSteps(turns, a);
   if (!a.dir) steps = -steps;
+  if (&a == &axes[Z_AXIS] && !zTargetAllowed((int64_t)a.fs->getCurrentPosition() + steps)) return -1;
   return a.fs->move(steps);
 }
 
@@ -324,6 +359,7 @@ static const char* applyControlSpeeds(const long requested[NAX], bool precision 
   }
   for (const auto& a : axes)
     if (!a.active || !a.driverOn || !a.fs) { releaseController(); return "Controller axis unavailable"; }
+  if (requested[0] != requested[5]) return "C0 and C1 controller speeds must match";
   for (int i = 0; i < NAX; ++i) controllerDesiredHz[i] = requested[i];
   controllerLastFrame = millis();
   if (precision != controllerPrecision) {
@@ -336,7 +372,7 @@ static const char* applyControlSpeeds(const long requested[NAX], bool precision 
   // Releasing X before the stop completes cancels the resolution change.
   controllerModeChanging = false;
   for (int i = 0; i < NAX; ++i) {
-    auto& a = axes[i]; const int32_t hz = requested[i], old = controllerHz[i];
+    auto& a = axes[i]; const int32_t hz = (i == Z_AXIS && zLimitsEnabled() && !zTopKnown) ? 0 : requested[i], old = controllerHz[i];
     if (hz == old) continue;
     a.spinning = false;
     if (hz == 0) a.fs->stopMove();
@@ -346,7 +382,7 @@ static const char* applyControlSpeeds(const long requested[NAX], bool precision 
       if ((hz > 0 && old > 0) || (hz < 0 && old < 0)) {
         // Update speed without repeatedly restarting the continuous ramp.
         a.fs->applySpeedAcceleration();
-      } else result = hz > 0 ? a.fs->runForward() : a.fs->runBackward();
+      } else result = i == Z_AXIS ? startZRate(hz) : (hz > 0 ? a.fs->runForward() : a.fs->runBackward());
       if (result != MOVE_OK) {
         releaseController(); return "Controller move rejected";
       }
@@ -428,6 +464,46 @@ static void controlSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, 
   controlSocket.sendTXT(client, String("{\"ok\":1,\"seq\":") + fields[0] + "}");
 }
 
+static void handleZLimits() {
+  if (controllerArmed || (axes[Z_AXIS].fs && axes[Z_AXIS].fs->isRunning())) {
+    server.send(409, "text/plain", "Disable controller and stop Z before setting limits"); return;
+  }
+  const String action = server.arg("action");
+  if (action == "forget") { zTopKnown = false; server.send(200, "text/plain", "Z top reference cleared"); return; }
+  if (action == "top") {
+    if (!axes[Z_AXIS].fs) { server.send(409, "text/plain", "Activate Z first"); return; }
+    // Record the selected up direction together with the physical top reference.
+    // Do not silently apply the draft travel distance; Save remains explicit.
+    long up = zPositiveUp ? 1 : 0;
+    if (server.hasArg("positiveUp") && !integerArg("positiveUp", 0, 1, up)) {
+      server.send(400, "text/plain", "Invalid Z up direction"); return;
+    }
+    if (zPositiveUp != (up != 0)) { zPositiveUp = up != 0; saveSettings(); }
+    axes[Z_AXIS].fs->setCurrentPosition(0); zTopKnown = true;
+    server.send(200, "text/plain", "Z top zero set; upward limit is ACTIVE"); return;
+  }
+  if (action != "save") { server.send(400, "text/plain", "Unknown Z limit action"); return; }
+  const String raw = server.arg("turns"); char* end = nullptr;
+  const float travel = strtof(raw.c_str(), &end); long up;
+  if (!raw.length() || end == raw.c_str() || *end != '\0' || !isfinite(travel) || travel < 0 ||
+      (travel > 0 && (double)travel * cfg.stepsPerRev < 1) ||
+      (double)travel * cfg.stepsPerRev > INT32_MAX / 256 ||
+      !integerArg("positiveUp", 0, 1, up)) {
+    server.send(400, "text/plain", "Enter 0 to disable, or a positive travel of at least one full motor step"); return;
+  }
+  const bool sameDirection = zPositiveUp == (up != 0);
+  if (travel > 0 && zTopKnown && sameDirection) {
+    const int64_t logical = (int64_t)axes[Z_AXIS].fs->getCurrentPosition() * (zPositiveUp ? 1 : -1);
+    const int64_t bottom = (int64_t)floor((double)travel * cfg.stepsPerRev * axes[Z_AXIS].microsteps);
+    if (logical > 0 || logical < -bottom) {
+      server.send(409, "text/plain", "Current Z is outside this range; move inside it before saving"); return;
+    }
+  }
+  if (!sameDirection) zTopKnown = false;
+  zTravelTurns = travel; zPositiveUp = up != 0; saveSettings();
+  server.send(200, "text/plain", zTravelTurns > 0 ? (zTopKnown ? "Z top and bottom limits active" : "Z range saved; set top zero before moving Z") : (zTopKnown ? "Z top limit active; lower limit not set" : "Z limits disabled"));
+}
+
 // ---- Web UI ----
 static const char PAGE[] PROGMEM = R"rawhtml(
 <!doctype html><html><head><meta charset="utf-8">
@@ -478,16 +554,16 @@ static const char PAGE[] PROGMEM = R"rawhtml(
 const MS=[1,2,4,8,16,32,64,128,256];
 const MOTOR={C0:'Nema 8 · 0.6A',C1:'Nema 8 · 0.6A',X:'Nema 17 · 2.1A',Y0:'Nema 17 · 2.1A',Y1:'Nema 17 · 2.1A',Z:'Nema 17 · 2.1A'};
 const status=document.getElementById('status');
-let S={}, AX=[], VAC={l:0,r:0}, YLINK=0;
+let S={}, AX=[], VAC={l:0,r:0}, YLINK=0,ZLIMIT={turns:0,positiveUp:1,topKnown:0};
 function api(u){return http(u).then(t=>{status.textContent=t;return t;}).catch(e=>{status.textContent=e.message;});}
 function act(on,off){on.classList.add('on');off.classList.remove('on');}
 
 function renderVac(){
  document.getElementById('vacwrap').innerHTML=`
   <div class="card"><h2>Vacuum</h2>
-   <div class="row"><label>Vacuum Left (GPIO7)</label>
+   <div class="row"><label>Vacuum Left (GPIO4)</label>
     <div class="toggle"><button id="vl0">OFF</button><button id="vl1">ON</button></div></div>
-   <div class="row"><label>Vacuum Right (GPIO4)</label>
+   <div class="row"><label>Vacuum Right (GPIO7)</label>
     <div class="toggle"><button id="vr0">OFF</button><button id="vr1">ON</button></div></div>
   </div>`;
  const vl0=gid('vl0'),vl1=gid('vl1'),vr0=gid('vr0'),vr1=gid('vr1');
@@ -567,19 +643,28 @@ function saveSettings(){
  AX.forEach(a=>q.set('ax'+a.n,gid('ax'+a.n).checked?1:0));
  api('/settings?'+q.toString()).then(()=>load());
 }
-async function load(){try{const d=JSON.parse(await http('/state'));S=d.set;AX=d.ax;VAC=d.vac;YLINK=d.ylink;render();renderGp();}catch(e){status.textContent=e.message;}}
+async function load(){try{const d=JSON.parse(await http('/state'));S=d.set;AX=d.ax;VAC=d.vac;YLINK=d.ylink;ZLIMIT=d.zlimit||ZLIMIT;render();renderGp();}catch(e){status.textContent=e.message;}}
 
 // ---------- Xbox / Gamepad control ----------
 function stored(key,fallback){try{return JSON.parse(localStorage.getItem(key))||fallback;}catch{return fallback;}}
-const SCH_DEF={xy:{fast:3000,slow:120,dz:0.16,micro:1,accel:30000,invX:false,invY:true},z:{fast:1500,slow:100,dz:0.10,micro:1,accel:20000,invert:false},c:{fast:2000,slow:100,dz:0.16,micro:1,accel:20000,invert:false}};
+const SCH_DEF={xy:{fast:12000,slow:120,dz:0.16,micro:1,accel:30000,invX:true,invY:true},z:{fast:12000,slow:100,dz:0.10,micro:1,accel:20000,invert:false},c:{fast:12000,slow:100,dz:0.16,micro:1,accel:20000,invert:false}};
 let scheme=stored('pnpScheme',{});
 for(const k of ['xy','z','c']){scheme[k]=Object.assign({},SCH_DEF[k],scheme[k]);scheme[k].micro=1;}
-let gpMap=stored('pnpGpMap',{});gpMap.ax=gpMap.ax||{};gpMap.btn=Object.assign({stopAll:'b1',vacL:'b4',vacR:'b5'},gpMap.btn||{});
-let macros=stored('pnpMacros',{}),GP=null,learn=null,cActive='C1',armed=false,arming=false,epoch=0;
+// Apply the requested defaults once to existing browsers as well as new profiles.
+// Later user tuning remains editable and is preserved across reloads.
+if(localStorage.getItem('pnpJogDefaults')!=='2026-10-24-12k'){
+ for(const k of ['xy','z','c'])scheme[k].fast=12000;
+ scheme.xy.invX=true;
+ localStorage.setItem('pnpScheme',JSON.stringify(scheme));
+ localStorage.setItem('pnpJogDefaults','2026-10-24-12k');
+}
+let gpMap=stored('pnpGpMap',{});gpMap.ax=gpMap.ax||{};gpMap.btn=Object.assign({stopAll:'b1'},gpMap.btn||{});gpMap.btn.vacL='b4';gpMap.btn.vacR='b5';
+let vacuumPending={l:false,r:false};
+let macros=stored('pnpMacros',{}),GP=null,learn=null,cActive='C0 + C1',armed=false,arming=false,epoch=0;
 let mode=localStorage.getItem('pnpControlMode')||'standard',sensitivity=Math.max(10,Math.min(100,+(localStorage.getItem('pnpSensitivity')||100)));
 let socket=null,sequence=0,pendingSequence=0,pendingAt=0;
 let prevB=[],pendingFrame=false,lastSent=-Infinity,lastKey='',lastAck=0,rtt=0,lastPaint=0,armGeneration=0;
-const ACTIONS=[['stopAll','STOP ALL'],['vacL','Vacuum left'],['vacR','Vacuum right'],['m1go','Recall position 1'],['m2go','Recall position 2'],['m3go','Recall position 3'],['zero','Zero positions']];
+const ACTIONS=[['stopAll','STOP ALL'],['m1go','Recall position 1'],['m2go','Recall position 2'],['m3go','Recall position 3'],['zero','Zero positions']];
 const ZERO=()=>({x:0,y:0,z:0,c0:0,c1:0,precision:0});
 const esc=v=>String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function saveSch(){localStorage.setItem('pnpScheme',JSON.stringify(scheme));}
@@ -589,8 +674,7 @@ function getPad(){try{const pads=navigator.getGamepads?navigator.getGamepads():[
 function discoverPad(){try{const pads=Array.from(navigator.getGamepads?navigator.getGamepads():[]);const gp=pads.find(p=>p&&p.connected);GP=gp?gp.index:null;}catch{GP=null;}}
 async function http(url,method='GET',timeout=3000){const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),timeout);try{const r=await fetch(url,{method,cache:'no-store',signal:abort.signal});const t=await r.text();if(!r.ok)throw Error(t||'Controller request failed');return t;}finally{clearTimeout(timer);}}
 function setMessage(t){status.textContent=t;}
-function setC(n){cActive=n;for(const v of ['C0','C1']){const e=gid('pick'+v);if(e){e.classList.toggle('on',v===n);e.setAttribute('aria-pressed',String(v===n));}}const e=gid('cact');if(e)e.textContent=n;}
-function paintState(message){const gp=getPad(),state=gid('gpstate'),arm=gid('gparm');if(state){state.textContent=message||(armed?'Enabled · ready to move':gp?'Connected · controller disabled':'No controller');state.classList.toggle('enabled',armed);}if(arm){arm.textContent=arming?'Preparing motors…':armed?'Disable controller':'Enable controller';arm.disabled=arming||!gp||!!learn||!socket||socket.readyState!==WebSocket.OPEN;}const panel=gid('controller');if(panel)panel.classList.toggle('live',armed);const field=gid('manualcontrols');if(field)field.disabled=armed;gid('gpadvanced')?.querySelectorAll('input,select,button').forEach(e=>{e.disabled=armed||arming||(e.classList.contains('gpr')&&!macros[e.dataset.s]);});}
+function paintState(message){const gp=getPad(),state=gid('gpstate'),arm=gid('gparm');if(state){state.textContent=message||(armed?'Enabled · ready to move':gp?'Connected · controller disabled':'No controller');state.classList.toggle('enabled',armed);}if(arm){arm.textContent=arming?'Preparing motors…':armed?'Disable controller':'Enable controller';arm.disabled=arming||!gp||!!learn||!socket||socket.readyState!==WebSocket.OPEN;}const panel=gid('controller');if(panel)panel.classList.toggle('live',armed);const field=gid('manualcontrols');if(field)field.disabled=armed;for(const id of ['padvacL','padvacR']){const e=gid(id);if(e)e.disabled=!armed;}gid('gpadvanced')?.querySelectorAll('input,select,button').forEach(e=>{e.disabled=armed||arming||(e.classList.contains('gpr')&&!macros[e.dataset.s]);});}
 async function halt(reason='Stopped',disable=false){++armGeneration;armed=false;arming=false;pendingFrame=false;pendingSequence=0;lastKey='';paintState(reason);setMessage(reason);try{await http(disable?'/controller?action=stop':'/stopall',disable?'POST':'GET',1200);}catch{setMessage(reason+' · connection unavailable; machine timeout will stop controller motion');} }
 async function enableController(){if(!socket||socket.readyState!==WebSocket.OPEN){setMessage('Controller connection is not ready.');return;}if(armed){await halt('Controller disabled',true);await load();return;}const gp=getPad();if(!gp)return;if(Object.entries(desiredFrame(gp)).some(([k,v])=>k!=='precision'&&v!==0)){setMessage('Center both sticks and release the triggers before enabling.');return;}
  const generation=++armGeneration;arming=true;paintState();const q=new URLSearchParams({action:'arm'});for(const [g,m,a] of [['xy','mxy','axy'],['z','mz','az'],['c','mc','ac']]){q.set(m,scheme[g].micro);q.set(a,scheme[g].accel);}
@@ -598,10 +682,10 @@ async function enableController(){if(!socket||socket.readyState!==WebSocket.OPEN
  catch(e){setMessage(e.message);armed=false;}finally{if(generation===armGeneration){arming=false;paintState();}} }
 function qhz(v,cfg,precision=false){const a=Math.min(1,Math.abs(v)),dz=Math.max(.02,Math.min(.5,+cfg.dz||.16));if(a<=dz)return 0;const t=(a-dz)/(1-dz),cap=Math.min(+S.spdMax||20000,Math.max(50,+cfg.fast||1000));const slow=Math.min(cap,Math.max(1,+cfg.slow||100));// Tuning rates are kept in 1/16-step equivalent units to retain existing travel speeds.
  const micro=precision?16:1;const hz=Math.round((slow+t*(cap-slow))*(sensitivity/100)*(precision?.25:1)*micro/16);return Math.sign(v)*Math.max(1,hz);}
-function desiredFrame(gp){const f=ZERO(),precision=!!gp.buttons[2]?.pressed;f.precision=precision?1:0;if(mode==='custom'){for(const [i,m] of Object.entries(gpMap.ax)){if(!m.dest)continue;let v=gp.axes[i]||0;if(m.inv)v=-v;const key={X:'x',Y0:'y',Y1:'y',Z:'z',C0:'c0',C1:'c1'}[m.dest];if(!key)continue;const n=qhz(v,{dz:m.dz??.15,fast:m.scale||2000,slow:100},precision);if(Math.abs(n)>Math.abs(f[key]))f[key]=n;}return f;}
+function desiredFrame(gp){const f=ZERO(),precision=!!gp.buttons[2]?.pressed;f.precision=precision?1:0;if(mode==='custom'){for(const [i,m] of Object.entries(gpMap.ax)){if(!m.dest)continue;let v=gp.axes[i]||0;if(m.inv)v=-v;const key={X:'x',Y0:'y',Y1:'y',Z:'z',C0:'c0',C1:'c1'}[m.dest];if(!key)continue;const n=qhz(v,{dz:m.dz??.15,fast:m.scale||2000,slow:100},precision);if(Math.abs(n)>Math.abs(f[key]))f[key]=n;}f.c0=f.c1=(Math.abs(f.c0)>=Math.abs(f.c1)?f.c0:f.c1);return f;}
  f.x=qhz((gp.axes[0]||0)*(scheme.xy.invX?-1:1),scheme.xy,precision);f.y=qhz((gp.axes[1]||0)*(scheme.xy.invY?-1:1),scheme.xy,precision);
  f.z=qhz(((gp.buttons[7]?.value||0)-(gp.buttons[6]?.value||0))*(scheme.z.invert?-1:1),scheme.z,precision);
- f[cActive.toLowerCase()]=qhz((gp.axes[2]||0)*(scheme.c.invert?-1:1),scheme.c,precision);return f;}
+ f.c0=f.c1=qhz((gp.axes[2]||0)*(scheme.c.invert?-1:1),scheme.c,precision);return f;}
 function connectControlSocket(){
  socket=new WebSocket('ws://'+location.hostname+':81/');
  socket.onopen=()=>{paintState();if(!armed)setMessage('Controller link connected. Center the sticks, then enable.');};
@@ -617,29 +701,45 @@ function tuningGroup(g,label,extra){const c=scheme[g];return `<h3>${label}</h3><
 function renderGp(){const el=gid('gppanel');if(!el)return;const wasOpen=gid('gpadvanced')?.open, gp=getPad();
  el.innerHTML=`<section class="controller" id="controller"><div class="gpheading"><div><div class="eyebrow">XBOX CONTROL</div><h1>Move the machine.</h1><div id="gpdevice" class="muted"></div></div><span class="statepill" id="gpstate"></span></div>
  <div class="gpbar"><button class="primary" id="gparm">Enable controller</button><span class="muted" id="gplink">Waiting for controller</span></div>
- <div class="controllergrid"><div class="controlmap"><div class="stickunit"><div class="stick" aria-label="Left stick input"><i id="leftdot"></i><span>+</span></div><b>Left stick</b><span class="muted">X / paired Y motors</span><output id="xyread">X 0 · Y 0 Hz</output></div><div class="stickunit"><div class="stick" aria-label="Right stick input"><i id="rightdot"></i><span>+</span></div><b>Right stick</b><span class="muted">Rotate <b id="cact">${cActive}</b></span><output id="cread">0 Hz</output></div><div class="triggers"><label>LT · Z down<meter id="ltmeter" min="0" max="1" value="0"></meter></label><label>RT · Z up<meter id="rtmeter" min="0" max="1" value="0"></meter></label><output id="zread">Z 0 Hz</output></div></div>
- <div class="quickcontrols"><label>Right stick motor</label><div class="toggle"><button id="pickC0" aria-pressed="false">C0</button><button id="pickC1" aria-pressed="true">C1</button></div><p class="muted">Press <kbd>A</kbd> to switch.</p><label for="sensitivity">Jog speed <output id="sensitivityvalue">${sensitivity}%</output></label><input id="sensitivity" type="range" min="10" max="100" step="5" value="${sensitivity}"><p class="muted">Normal: full steps. Hold <kbd>X</kbd> for 1/16-step precision at quarter speed. <b id="stepmode">Full step · 1</b></p><div class="buttonlegend"><span id="chipB"><kbd>B</kbd> Stop</span><span id="chipLB"><kbd>LB</kbd> Left vacuum</span><span id="chipRB"><kbd>RB</kbd> Right vacuum</span><span id="chipX"><kbd>X</kbd> Precision</span></div><p class="muted" id="vacread">Vacuums · left ${VAC.l?'ON':'OFF'} · right ${VAC.r?'ON':'OFF'}</p></div></div>
+ <div class="controllergrid"><div class="controlmap"><div class="stickunit"><div class="stick" aria-label="Left stick input"><i id="leftdot"></i><span>+</span></div><b>Left stick</b><span class="muted">X / paired Y motors</span><output id="xyread">X 0 · Y 0 Hz</output></div><div class="stickunit"><div class="stick" aria-label="Right stick input"><i id="rightdot"></i><span>+</span></div><b>Right stick</b><span class="muted">Rotate <b id="cact">${cActive}</b></span><output id="cread">0 Hz</output></div><div class="triggers"><label>LT · Z down<meter id="ltmeter" min="0" max="1" value="0"></meter></label><label>RT · Z up<meter id="rtmeter" min="0" max="1" value="0"></meter></label><output id="zread">Z 0 Hz</output><output id="zsavedstatus" style="grid-column:1/-1">${zLimitStatus()}</output></div></div>
+ <div class="quickcontrols"><label>Right stick motors</label><p><b>C0 + C1 · always together</b></p><label for="sensitivity">Jog speed <output id="sensitivityvalue">${sensitivity}%</output></label><input id="sensitivity" type="range" min="10" max="100" step="5" value="${sensitivity}"><p class="muted">Normal: full steps. Hold <kbd>X</kbd> for 1/16-step precision at quarter speed. <b id="stepmode">Full step · 1</b></p><div class="buttonlegend"><span id="chipB"><kbd>B</kbd> Stop</span><span id="chipLB"><kbd>LB</kbd> Left vacuum</span><span id="chipRB"><kbd>RB</kbd> Right vacuum</span><span id="chipX"><kbd>X</kbd> Precision</span></div><div class="toggle"><button id="padvacL">LB · Left vacuum</button><button id="padvacR">RB · Right vacuum</button></div><p class="muted" id="vacread">Vacuums · left ${VAC.l?'ON':'OFF'} · right ${VAC.r?'ON':'OFF'}</p></div></div>
  <p class="gpnote">Enable prepares all six motors. Center the sticks first. Disconnecting the controller, leaving this page, or losing updates stops controller motion. Motor current is unchanged.</p>
- <details id="gpadvanced" ${wasOpen?'open':''}><summary>Controller tuning & saved positions</summary><p class="muted">Disable the controller to change these settings.</p><label>Control layout<select id="controlmode"><option value="standard">Xbox preset</option><option value="custom">Custom stick mappings</option></select></label>
+ <details id="gpadvanced" ${wasOpen?'open':''}><summary>Controller tuning & saved positions</summary><p class="muted">Disable the controller to change these settings.</p><h3>Z travel limits · zero at top</h3><p><b id="zlimitapplied">${zLimitStatus()}</b></p><p id="zlimitdraft" class="muted" role="status"></p><p class="muted">${zLimitStatus()}<br>Travel is in motor revolutions, not millimetres. Set 0 for no lower limit. Re-establish top zero after each restart or any manual movement while unpowered. Clear the reference before jogging to an unknown top.</p><div class="tunegrid"><label>Travel below top (motor turns)<input id="ztravel" type="number" min="0" step="0.01" value="${ZLIMIT.turns}"></label><label><input id="zpositive" type="checkbox" ${ZLIMIT.positiveUp?'checked':''}> Positive motor direction is up</label></div><div class="btns"><button id="savezlimits">Save Z limits</button><button id="setztop">Set current Z as top (0)</button><button id="clearztop">Clear top reference</button></div><p class="muted">Set top zero to immediately protect the top. Leave travel at 0 for no lower limit, or save a measured distance to protect the bottom too. Confirm the up direction first. Software limits cannot detect missed steps or a moved motor.</p><label>Control layout<select id="controlmode"><option value="standard">Xbox preset</option><option value="custom">Custom stick mappings</option></select></label>
  ${tuningGroup('xy','Left stick · X / Y',`<label><input class="sc" type="checkbox" data-g="xy" data-k="invX" ${scheme.xy.invX?'checked':''}> Reverse X</label><label><input class="sc" type="checkbox" data-g="xy" data-k="invY" ${scheme.xy.invY?'checked':''}> Reverse Y</label>`)}${tuningGroup('z','Triggers · Z',`<label><input class="sc" type="checkbox" data-g="z" data-k="invert" ${scheme.z.invert?'checked':''}> Reverse Z</label>`)}${tuningGroup('c','Right stick · C0 / C1',`<label><input class="sc" type="checkbox" data-g="c" data-k="invert" ${scheme.c.invert?'checked':''}> Reverse rotation</label>`)}
- <details><summary>Custom mappings & button learning</summary><p class="muted">B always stops. In Xbox preset, A switches motors and X is precision.</p>${[0,1,2,3].map(i=>{const m=gpMap.ax[i]||{};return `<div class="mappingrow"><label>Stick axis ${i}<select class="gpd" data-i="${i}"><option value="">Unassigned</option>${['X','Y0','Y1','Z','C0','C1'].map(n=>`<option ${m.dest===n?'selected':''}>${n}</option>`).join('')}</select></label><label>Max Hz<input class="gps" data-i="${i}" type="number" min="50" value="${+m.scale||2000}"></label><label>Deadzone<input class="gpz" data-i="${i}" type="number" min="0.02" max="0.5" step="0.02" value="${+m.dz||.15}"></label><label><input class="gpi" data-i="${i}" type="checkbox" ${m.inv?'checked':''}> Reverse</label></div>`;}).join('')}${ACTIONS.map(([a,label])=>`<div class="actionrow"><span>${label} · <b>${esc(gpMap.btn[a]||'unassigned')}</b></span><button class="gpl" data-a="${a}">${learn===a?'Press a button…':'Learn'}</button></div>`).join('')}</details>
+ <details><summary>Custom mappings & button learning</summary><p class="muted">B always stops. LB/RB always toggle left/right vacuum. X is precision. C0 and C1 always run together.</p>${[0,1,2,3].map(i=>{const m=gpMap.ax[i]||{};return `<div class="mappingrow"><label>Stick axis ${i}<select class="gpd" data-i="${i}"><option value="">Unassigned</option>${['X','Y0','Y1','Z','C0','C1'].map(n=>`<option ${m.dest===n?'selected':''}>${n}</option>`).join('')}</select></label><label>Max Hz<input class="gps" data-i="${i}" type="number" min="50" value="${+m.scale||2000}"></label><label>Deadzone<input class="gpz" data-i="${i}" type="number" min="0.02" max="0.5" step="0.02" value="${+m.dz||.15}"></label><label><input class="gpi" data-i="${i}" type="checkbox" ${m.inv?'checked':''}> Reverse</label></div>`;}).join('')}${ACTIONS.map(([a,label])=>`<div class="actionrow"><span>${label} · <b>${esc(gpMap.btn[a]||'unassigned')}</b></span><button class="gpl" data-a="${a}">${learn===a?'Press a button…':'Learn'}</button></div>`).join('')}</details>
  <h3>Saved positions</h3>${[1,2,3].map(n=>`<div class="actionrow"><span>Position ${n} · ${macros[n]?'saved':'empty'}</span><div><button class="gpm" data-s="${n}">Save current</button> <button class="gpr" data-s="${n}" ${macros[n]?'':'disabled'}>Recall</button></div></div>`).join('')}<button id="resetresponse">Restore responsive defaults</button></details></section>`;
  gid('gpdevice').textContent=gp?gp.id:(!navigator.getGamepads?'Gamepad access unavailable in this browser.':'Connect an Xbox controller, then press any button.');
- gid('gparm').onclick=enableController;gid('pickC0').onclick=()=>setC('C0');gid('pickC1').onclick=()=>setC('C1');setC(cActive);
+ gid('gparm').onclick=enableController;gid('padvacL').onclick=()=>doAction('vacL');gid('padvacR').onclick=()=>doAction('vacR');
  gid('sensitivity').oninput=e=>{sensitivity=+e.target.value;gid('sensitivityvalue').textContent=sensitivity+'%';localStorage.setItem('pnpSensitivity',sensitivity);};
  gid('controlmode').value=mode;gid('controlmode').onchange=e=>{mode=e.target.value;localStorage.setItem('pnpControlMode',mode);};
  el.querySelectorAll('.sc').forEach(x=>x.onchange=e=>{const g=e.target.dataset.g,k=e.target.dataset.k;let v=e.target.type==='checkbox'?e.target.checked:+e.target.value;if(k==='dz')v=Math.max(.02,Math.min(.5,v));if(k==='accel')v=Math.max(100,Math.min(S.accMax||50000,v));if(k==='fast'||k==='slow')v=Math.max(20,Math.min(S.spdMax||20000,v));scheme[g][k]=v;saveSch();});
  for(const [selector,key,convert] of [['.gpd','dest',v=>v],['.gps','scale',Number],['.gpz','dz',Number],['.gpi','inv',Boolean]])el.querySelectorAll(selector).forEach(x=>x.onchange=e=>{const i=e.target.dataset.i;gpMap.ax[i]=gpMap.ax[i]||{};gpMap.ax[i][key]=convert(e.target.type==='checkbox'?e.target.checked:e.target.value);saveGp();});
  el.querySelectorAll('.gpl').forEach(x=>x.onclick=()=>{learn=learn===x.dataset.a?null:x.dataset.a;renderGp();});el.querySelectorAll('.gpm').forEach(x=>x.onclick=()=>saveMacro(x.dataset.s));el.querySelectorAll('.gpr').forEach(x=>x.onclick=()=>gotoMacro(x.dataset.s));
+ gid('savezlimits').onclick=()=>updateZLimits(false);gid('setztop').onclick=()=>updateZLimits(true);gid('clearztop').onclick=async()=>{try{const text=await http('/zlimits?action=forget','POST');await load();setMessage(text);}catch(e){setMessage(e.message);}};gid('ztravel').oninput=zLimitDraft;gid('zpositive').onchange=zLimitDraft;
  gid('resetresponse').onclick=()=>{scheme=JSON.parse(JSON.stringify(SCH_DEF));saveSch();renderGp();};paintState();}
 function toggleGp(){gid('gppanel').scrollIntoView({behavior:'smooth'});}
+function zLimitStatus(){return ZLIMIT.topKnown?(ZLIMIT.turns>0?'Z limits ON · top 0 / bottom '+ZLIMIT.turns+' motor turns below':'Z TOP LIMIT ON · zero at top; no lower limit'):(ZLIMIT.turns>0?'Z BLOCKED · '+ZLIMIT.turns+' turns saved; set top zero':'Z limits OFF · top zero not set');}
+function zLimitDraft(){const travel=gid('ztravel'),up=gid('zpositive'),note=gid('zlimitdraft');if(!travel||!up||!note)return;const dirty=Number(travel.value)!==Number(ZLIMIT.turns)||up.checked!==!!ZLIMIT.positiveUp;note.textContent=dirty?'Unsaved limit changes — click Save Z limits to apply.':'';}
+async function updateZLimits(top){
+ const draft={turns:gid('ztravel').value,positiveUp:gid('zpositive').checked};
+ const q=top?new URLSearchParams({action:'top',positiveUp:draft.positiveUp?1:0}):new URLSearchParams({action:'save',turns:draft.turns,positiveUp:draft.positiveUp?1:0});
+ const buttons=[gid('savezlimits'),gid('setztop')];buttons.forEach(b=>b.disabled=true);
+ try{
+  const text=await http('/zlimits?'+q,'POST');
+  const d=JSON.parse(await http('/state'));S=d.set;AX=d.ax;VAC=d.vac;YLINK=d.ylink;ZLIMIT=d.zlimit;
+  render();renderGp();
+  if(top){gid('ztravel').value=draft.turns;gid('zpositive').checked=draft.positiveUp;}
+  zLimitDraft();setMessage(text+(top&&Number(draft.turns)!==Number(ZLIMIT.turns)?' · Travel value preserved; click Save Z limits to apply it.':''));
+ }catch(e){setMessage(e.message);zLimitDraft();}
+ finally{paintState();}
+}
 async function saveMacro(n){try{const d=JSON.parse(await http('/state'));const m={};for(const a of d.ax)if(a.active)m[a.n]=Math.round(a.pos*16/a.mic);macros[n]=m;saveMac();renderGp();setMessage('Saved position '+n);}catch(e){setMessage(e.message);}}
 async function gotoMacro(n){const m=macros[n];if(!m)return;await halt('Moving to saved position '+n);const d=JSON.parse(await http('/state'));const micros=Object.fromEntries(d.ax.map(a=>[a.n,a.mic]));for(const [axis,pos] of Object.entries(m)){if(YLINK&&axis==='Y1')continue;await api(`/goto?axis=${axis}&pos=${Math.round(pos*(micros[axis]||1)/16)}`);} }
-async function doAction(a){if(a==='stopAll')return halt('Stopped · enable controller to resume');if(a==='vacL'||a==='vacR'){if(!armed)return;const side=a==='vacL'?'l':'r',next=VAC[side]?0:1;try{await http('/vac?side='+(side==='l'?'left':'right')+'&on='+next);VAC[side]=next;gid('vacread').textContent=`Vacuums · left ${VAC.l?'ON':'OFF'} · right ${VAC.r?'ON':'OFF'}`;}catch(e){setMessage(e.message);} }else if(a==='zero'){await halt('Controller stopped');await api('/zero?axis=all');}else if(a[0]==='m')await gotoMacro(a[1]);}
+async function doAction(a){if(a==='stopAll')return halt('Stopped · enable controller to resume');if(a==='vacL'||a==='vacR'){if(!armed)return;const side=a==='vacL'?'l':'r';if(vacuumPending[side])return;vacuumPending[side]=true;const next=VAC[side]?0:1;try{await http('/vac?side='+(side==='l'?'left':'right')+'&on='+next);VAC[side]=next;gid('vacread').textContent=`Vacuums · left ${VAC.l?'ON':'OFF'} · right ${VAC.r?'ON':'OFF'}`;}catch(e){setMessage(e.message);}finally{vacuumPending[side]=false;} }else if(a==='zero'){await halt('Controller stopped');await api('/zero?axis=all');}else if(a[0]==='m')await gotoMacro(a[1]);}
 function paintInputs(gp,f,now){if(now-lastPaint<33)return;lastPaint=now;const lx=gp?.axes[0]||0,ly=gp?.axes[1]||0,rx=gp?.axes[2]||0,ry=gp?.axes[3]||0;
  gid('stepmode').textContent=f.precision?'Precision · 1/16':'Full step · 1';
  gid('leftdot').style.transform=`translate(${lx*32}px,${ly*32}px)`;gid('rightdot').style.transform=`translate(${rx*32}px,${ry*32}px)`;
- gid('ltmeter').value=gp?.buttons[6]?.value||0;gid('rtmeter').value=gp?.buttons[7]?.value||0;gid('xyread').textContent=`X ${f.x} · Y ${f.y} Hz`;gid('cread').textContent=`${f[cActive.toLowerCase()]} Hz`;gid('zread').textContent=`Z ${f.z} Hz`;
+ gid('ltmeter').value=gp?.buttons[6]?.value||0;gid('rtmeter').value=gp?.buttons[7]?.value||0;gid('xyread').textContent=`X ${f.x} · Y ${f.y} Hz`;gid('cread').textContent=`${f.c0} Hz`;gid('zread').textContent=`Z ${f.z} Hz`;
  for(const [id,i] of [['chipB',1],['chipLB',4],['chipRB',5],['chipX',2]])gid(id)?.classList.toggle('pressed',!!gp?.buttons[i]?.pressed);
  gid('gplink').textContent=armed?(rtt?`${Math.round(rtt)} ms · live`:'Connecting…'):gp?'Inputs visible · motion disabled':'Waiting for controller';}
 function poll(now){requestAnimationFrame(poll);let gp=getPad();if(!gp&&GP!==null){GP=null;if(armed||arming)halt('Controller disconnected');renderGp();}if(!gp&&GP===null){discoverPad();gp=getPad();if(gp)renderGp();}if(!gid('leftdot'))return;
@@ -647,8 +747,8 @@ function poll(now){requestAnimationFrame(poll);let gp=getPad();if(!gp&&GP!==null
  const b=gp.buttons.map(v=>v.pressed||v.value>.5);
  if(learn){const i=b.findIndex((v,i)=>v&&!prevB[i]);if(i>=0){gpMap.btn[learn]='b'+i;learn=null;saveGp();renderGp();}prevB=b;return;}
  if(b[1]&&!prevB[1]){halt('Stopped · enable controller to resume');prevB=b;return;}
- if(mode==='standard'&&b[0]&&!prevB[0])setC(cActive==='C1'?'C0':'C1');
- if(armed){for(let i=0;i<b.length;i++)if(i!==1&&b[i]&&!prevB[i])for(const [a,v] of Object.entries(gpMap.btn))if(v==='b'+i)doAction(a);
+
+ if(armed){if(b[4]&&!prevB[4])doAction('vacL');if(b[5]&&!prevB[5])doAction('vacR');for(let i=0;i<b.length;i++)if(i!==1&&i!==2&&i!==4&&i!==5&&b[i]&&!prevB[i])for(const [a,v] of Object.entries(gpMap.btn))if(v==='b'+i)doAction(a);
   if(pendingFrame&&now-pendingAt>550){halt('Controller paused · connection stalled');}else sendFrame(desiredFrame(gp),now);}
  prevB=b;}
 addEventListener('gamepadconnected',e=>{if(!armed){GP=e.gamepad.index;renderGp();}});
@@ -670,7 +770,7 @@ static int axisIndex(const String& n) {
 static void handleRoot() { server.send_P(200, "text/html", PAGE); }
 
 static void handleState() {
-  String j = "{\"firmware\":\"pnp-precision-1\",\"controller\":" + String(controllerArmed ? 1 : 0) + ",\"set\":{";
+  String j = "{\"firmware\":\"pnp-toplimit-1\",\"controller\":" + String(controllerArmed ? 1 : 0) + ",\"set\":{";
   j += "\"curMin\":" + String(cfg.curMin) + ",\"curMax\":" + String(cfg.curMax);
   j += ",\"spdMin\":" + String(cfg.spdMin) + ",\"spdMax\":" + String(cfg.spdMax);
   j += ",\"accMin\":" + String(cfg.accMin) + ",\"accMax\":" + String(cfg.accMax);
@@ -694,7 +794,7 @@ static void handleState() {
     }
     j += "}";
   }
-  j += "],\"vac\":{\"l\":" + String(vacLeft ? 1 : 0) + ",\"r\":" + String(vacRight ? 1 : 0) +
+  j += "],\"zlimit\":{\"turns\":" + String(zTravelTurns, 6) + ",\"positiveUp\":" + String(zPositiveUp ? 1 : 0) + ",\"topKnown\":" + String(zTopKnown ? 1 : 0) + "},\"vac\":{\"l\":" + String(vacLeft ? 1 : 0) + ",\"r\":" + String(vacRight ? 1 : 0) +
        "},\"ylink\":" + String(yLinked ? 1 : 0) + "}";
   server.send(200, "application/json", j);
 }
@@ -718,7 +818,7 @@ static int ySibling(int i) {
 
 static bool applyField(Axis& a, const String& f, long v) {
   if      (f == "current") { a.current_mA = constrain(v, 0L, (long)a.maxCurrent); a.drv->rms_current(a.current_mA); }
-  else if (f == "micro")   { if (!validMicrosteps(v) || (a.fs && a.fs->isRunning())) return false; a.microsteps = v; a.drv->microsteps(a.microsteps == 1 ? 0 : a.microsteps); }
+  else if (f == "micro")   { if (&a == &axes[Z_AXIS] && zLimitsEnabled()) return false; if (!validMicrosteps(v) || (a.fs && a.fs->isRunning())) return false; if (&a == &axes[Z_AXIS] && a.microsteps != v) zTopKnown = false; a.microsteps = v; a.drv->microsteps(a.microsteps == 1 ? 0 : a.microsteps); }
   else if (f == "spread")  { a.spread = v; a.drv->en_spreadCycle(a.spread); }
   else if (f == "accel")   { a.accel = constrain(v, 1L, (long)cfg.accMax); if (a.fs) a.fs->setAcceleration(a.accel); }
   else if (f == "dir")     { a.dir = v; adjustIfSpinning(a); }         // never auto-starts
@@ -751,6 +851,7 @@ static void handleRun() {
   if (s >= 0 && (!axes[s].active || !axes[s].fs || !axes[s].driverOn)) {
     server.send(409, "text/plain", "Both linked Y axes must be active, connected and ON"); return;
   }
+  if (i == Z_AXIS && zLimitsEnabled() && !zTopKnown) { server.send(409, "text/plain", "Set Z top zero first"); return; }
   const bool spin = server.arg("mode") == "spin";
   const String value = server.arg("turns");
   char* end = nullptr;
@@ -813,7 +914,8 @@ static void handleJog() {
     if (!a.fs || !a.driverOn) continue;
     if (dir == 0) { a.fs->stopMove(); a.spinning = false; }
     else { a.fs->setAcceleration(a.accel); a.fs->setSpeedInHz(max<long>(hz, 1L));
-           if (dir > 0) a.fs->runForward(); else a.fs->runBackward(); }
+           if (k == Z_AXIS) { if (startZRate(dir > 0 ? max<long>(hz, 1L) : -max<long>(hz, 1L)) != MOVE_OK) { server.send(409, "text/plain", "Set Z top zero first"); return; } }
+           else if (dir > 0) a.fs->runForward(); else a.fs->runBackward(); }
   }
   server.send(200, "text/plain", "jog");
 }
@@ -823,7 +925,9 @@ static void handleGoto() {
   if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
   int i = axisIndex(server.arg("axis"));
   if (i < 0) { server.send(400, "text/plain", "bad axis"); return; }
-  long pos = server.arg("pos").toInt();
+  long pos;
+  if (!integerArg("pos", INT32_MIN, INT32_MAX, pos)) { server.send(400, "text/plain", "Invalid position"); return; }
+  if (i == Z_AXIS && !zTargetAllowed(pos)) { server.send(409, "text/plain", "Z target outside limits or top zero missing"); return; }
   int s = ySibling(i); int idxs[2] = {i, s};
   for (int n = 0; n < 2; n++) {
     int k = idxs[n]; if (k < 0) continue;
@@ -840,6 +944,8 @@ static void handleGoto() {
 static void handleZero() {
   if (controllerArmed) { server.send(409, "text/plain", "Disable controller before manual tuning or moves"); return; }
   String ax = server.arg("axis");
+  if (zLimitsEnabled() && (ax == "all" || ax == "Z")) { server.send(409, "text/plain", "Use Set current Z as top instead of zeroing limited Z"); return; }
+  for (const auto& a : axes) if ((ax == "all" || ax == a.name) && a.fs && a.fs->isRunning()) { server.send(409, "text/plain", "Stop motors before zeroing"); return; }
   for (int i = 0; i < NAX; i++)
     if ((ax == "all" || ax == axes[i].name) && axes[i].fs) axes[i].fs->setCurrentPosition(0);
   server.send(200, "text/plain", "zeroed " + ax);
@@ -859,7 +965,10 @@ static void handleSettings() {
   cfg.spdMin = getU("spdMin", cfg.spdMin);   cfg.spdMax = getU("spdMax", cfg.spdMax);
   cfg.accMin = getU("accMin", cfg.accMin);   cfg.accMax = getU("accMax", cfg.accMax);
   cfg.turnMin = getU("turnMin", cfg.turnMin); cfg.turnMax = getU("turnMax", cfg.turnMax);
-  cfg.stepsPerRev = getU("spr", cfg.stepsPerRev);
+  const uint32_t spr = getU("spr", cfg.stepsPerRev);
+  if (!spr || spr > 65535 || (double)zTravelTurns * spr > INT32_MAX / 256) { server.send(400, "text/plain", "Invalid steps per revolution for Z limits"); return; }
+  if (cfg.stepsPerRev != spr) zTopKnown = false;
+  cfg.stepsPerRev = spr;
   for (int i = 0; i < NAX; ++i) {
     bool was = axes[i].active;
     axes[i].active = getU((String("ax") + axes[i].name).c_str(), was) != 0;
@@ -993,6 +1102,7 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/state", HTTP_GET, handleState);
+  server.on("/zlimits", HTTP_POST, handleZLimits);
   server.on("/controller", HTTP_POST, handleController);
   server.on("/control", HTTP_POST, handleControlFrame);
   server.on("/motiontest", HTTP_POST, handleMotionTest);

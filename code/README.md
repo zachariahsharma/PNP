@@ -85,7 +85,7 @@ controller tuning values and their existing current limits. Enable state is
 never restored automatically on reload.
 
 - Left stick: X and both Y motors. Triggers: Z.
-- Right stick: C1 or C0; press A or use the on-screen selector to switch.
+- Right stick: C0 and C1 together; no selector or A-button switching.
 - Hold X for 1/16-step, quarter-speed precision; release it for full steps. The Jog speed slider scales motion
   speed without changing current or acceleration.
 - B, Escape, or the sticky STOP button stops motion and disables controller
@@ -119,7 +119,7 @@ hardware EN held OFF, in addition to the default 320-pulse test.
 
 Validation of `pnp-controller-4`: USB and OTA builds passed. Simulated Xbox
 browser tests covered neutral enable, simultaneous axes, one frame awaiting
-acknowledgement, A selection, X precision, B stop, disconnect, page blur,
+acknowledgement, C selection (before pairing update), X precision, B stop, disconnect, page blur,
 stalled responses and re-enabling after a session error. Live browser testing
 held neutral input for eight seconds: 37 acknowledgements, 22 ms median and
 421 ms maximum, with controller input remaining enabled. The earlier HTTP
@@ -160,3 +160,99 @@ resume motion. Browser tests checked saved-profile migration, X precision,
 rate scaling and the existing stop behavior. On the connected board, actual
 TMC2209 register reads confirmed 1 -> 16 -> 1 microsteps on all six drivers,
 with no STEP motion requested. All drivers were left OFF in full-step mode.
+
+
+## Z top-zero limits and paired C controller motion
+
+`pnp-zlimits-1` adds an adjustable Z soft travel limit. Open **Controller tuning
+& saved positions** with the controller disabled. **Travel below top** is in
+motor revolutions, not millimetres. `0` means no lower limit. A known top reference still enforces the upper
+limit; without a top reference and with travel 0, limits are OFF. The source default is `Z_TRAVEL_TURNS_DEFAULT` in `src/main.cpp`;
+a saved website setting overrides that default.
+
+Setup: with no top reference and travel 0, jog carefully to the desired top
+and disable the controller. Select **Set current Z as top (0)** to activate
+the upper limit immediately. Optionally save a measured positive travel
+below the top to add a bottom limit. Confirm **Positive motor direction is up** against the
+actual machine (and the existing Reverse Z control). With a positive travel, the permitted logical
+range is `-travel` through `0`; travel 0 permits any negative position. The travel and direction are saved to NVS;
+the top reference is deliberately not saved. After restarting, configured
+limits block Z until the top is established again. For unrestricted setup jogging, set travel to 0 and use **Clear top reference**.
+Setting travel 0 alone preserves protection from a known top. Re-establish the reference
+if the motor is moved while unpowered or loses steps; software position is
+open-loop, without a physical homing switch or encoder.
+
+Limited Z jog/spin commands use finite targets at the appropriate boundary,
+allowing the pulse planner to decelerate before the target even if network
+updates stall. The limits also reject manual relative and saved absolute moves
+outside the range. Full-step / X precision changes rescale both position and
+the boundary. Zero-all cannot silently redefine a limited Z reference, and
+manual Z microstep changes are blocked while limits are enabled. Steps/rev
+changes invalidate the top reference. Other axes remain usable when Z lacks
+a reference. The diagnostic `/motiontest` emits pulses only with hardware EN
+held OFF and restores its software positions.
+
+Configuration API: `POST /zlimits?action=save&turns=VALUE&positiveUp=1`;
+`POST /zlimits?action=top` sets the stationary current position to top zero;
+`POST /zlimits?action=forget` clears the reference. Configuration requires
+controller disabled and Z stopped. `/state` includes `zlimit`.
+
+Xbox right-stick control now always sends identical C0 and C1 commands;
+controller firmware rejects mismatched rates too. Individual manual controls
+remain independent for tuning. LB always toggles the left vacuum and RB the
+right, once per press (press again for OFF); old saved mappings cannot override
+them. Controller must be enabled. The on-screen LB/RB buttons show the same
+controls and text reports each vacuum's state. No real vacuum outputs were
+switched during verification; those UI actions were tested with mocked requests.
+
+Validation: host boundary tests cover upper/lower bounds, reversed direction,
+fractional travel and 1/16-step scaling. Browser tests cover both C commands,
+bumper toggling despite old saved mappings, no repeat while held, and mobile
+layout. USB/OTA builds pass. Live tests check invalid settings, missing top
+reference, blocked manual targets, top-bound controller commands at both
+resolutions and rejection of unequal C commands, without requesting physical
+travel. Limits are left OFF (`0`) with the top reference cleared and all drivers
+OFF, ready for the user's measured range.
+
+## October 24 controller default correction
+
+`pnp-defaults-1` corrects the installed machine's vacuum sides: logical left
+(LB) now uses GPIO4 (Q3/R12); logical right (RB) uses GPIO7 (Q1/R5). This swaps
+the actual outputs while retaining consistent left/right labels in both manual
+and controller views. Pumps remain OFF on startup.
+
+Default X direction is reversed. All three controller speed groups (XY, Z, C)
+now default to 12,000 in the existing 1/16-step-equivalent rate units. At full
+stick and 100% jog speed this is 750 full-step pulses/s in normal mode and
+3,000 pulses/s at 1/16 resolution in quarter-travel-speed precision mode.
+A one-time browser migration applies the new speed/direction defaults to saved
+profiles; later user tuning is preserved. Restore responsive defaults also
+restores these values.
+
+Validation: both firmware targets build, and simulated controller tests cover
+profile migration, reversed X, speed scaling, coupled C motion and one toggle
+per bumper press. The corrected physical vacuum sides need user observation;
+no pump was energized as part of the automated checks.
+
+
+## Top-zero enforcement repair
+
+`pnp-toplimit-1` fixes the zero-only setup: Set current Z as top immediately
+activates the upper bound, even with no lower travel configured. Previously
+travel 0 disabled both boundaries despite topKnown=true. Negative/downward
+positions remain unrestricted until a positive lower travel is saved. Clearing
+the top reference disables top-only protection; with positive travel and no
+reference, Z remains blocked pending a new zero.
+
+Setting top zero now records the selected up direction atomically and preserves
+any draft travel in the form. Unsaved changes are labelled, and the main
+controller view reports OFF, TOP LIMIT ON, full limits ON, or Z BLOCKED based
+on the board's saved settings. Top does not silently apply a draft bottom limit.
+
+Validation: host boundary tests cover top-only behaviour, both signs, fractional
+limits and precision resolution. Browser tests verify draft preservation, up
+direction, applied-state feedback, successful save and failed-save preservation.
+Live stationary tests verify that top-only trigger commands stop at zero with
+travel 0; existing finite-range, manual-target and precision tests also pass.
+USB and OTA builds succeeded. Test references were cleared and motors left OFF;
+the user must physically re-establish top zero after the firmware restart.
